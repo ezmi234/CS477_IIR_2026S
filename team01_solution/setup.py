@@ -27,6 +27,9 @@ setup(
         'console_scripts': [
             'standby_node = team01_solution.standby_node:main',
             'instruction_parser = team01_solution.instruction_parser:main',
+            'detection_node = team01_solution.detection_node:main',
+            'grasp_node = team01_solution.grasp_node:main',
+            'motion_node = team01_solution.motion_node:main',
         ],
     },
 )

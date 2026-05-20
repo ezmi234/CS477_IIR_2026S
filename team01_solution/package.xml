@@ -4,6 +4,7 @@
   <name>team01_solution</name>
   <version>0.0.0</version>
   <description>Team 01 solution for CS477 robotics integration challenge</description>
+  <maintainer email="camille@kaist.ac.kr">cam</maintainer>
   <license>Apache-2.0</license>
 
   <!-- Runtime dependencies -->

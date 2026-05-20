@@ -1,35 +1,96 @@
-# Team 01 Solution - PHASE 1
+# Team 01 Solution - PHASE 2
 
 ## Overview
 
-This is the Team 01 solution package for the CS477 robotics integration challenge, PHASE 1. The system implements a ROS2 framework for receiving and processing instructions in a robot manipulation scenario.
+This package implements the Phase 2 skeleton for the CS477 robotics integration challenge. It provides a lightweight ROS2 event-driven pipeline with a central instruction orchestrator and placeholder modules for detection, grasp, and motion stages.
 
-## Architecture
+## Phase 2 Architecture
 
-### Nodes
+The system is built as a message-driven pipeline. Each node owns a single responsibility and communicates only over ROS topics.
 
-#### 1. **standby_node**
-- **Purpose**: Establishes system baseline and readiness state
-- **Behavior**: Initializes in standby mode, logs system status
-- **Topic**: None (passive initialization)
+```
+/instruction (std_msgs/String)
+        |
+        v
+instruction_parser
+        |
+      / | \
+     v  v  v
+/detect_request   /grasp_request   /motion_request
+     |               |                |
+     v               v                v
+ detection_node    grasp_node     motion_node
+     |               |                |
+     v               v                v
+/detect_result    /grasp_result   /motion_result
+        \             |              /
+         --------------v-------------
+                   parser
+```
+
+### Node responsibilities
+
+#### `standby_node`
+- **Purpose**: system startup readiness
+- **Subscriptions**: none
+- **Publications**: none
+- **Behavior**: logs "System is in standby mode." and stays alive
 - **File**: `team01_solution/standby_node.py`
 
-#### 2. **instruction_parser**
-- **Purpose**: Subscribes to instruction topic and processes incoming commands
-- **Behavior**: Listens on `/instruction` topic (std_msgs/String), logs received instructions
-- **Topic**: Subscribes to `/instruction` (std_msgs/String)
+#### `instruction_parser`
+- **Purpose**: central orchestrator for Phase 2
+- **Subscriptions**:
+  - `/instruction` (std_msgs/String)
+  - `/detect_result` (std_msgs/String)
+  - `/grasp_result` (std_msgs/String)
+  - `/motion_result` (std_msgs/String)
+- **Publications**:
+  - `/detect_request` (std_msgs/String)
+  - `/grasp_request` (std_msgs/String)
+  - `/motion_request` (std_msgs/String)
+- **Behavior**:
+  - parses generic instructions like `pick:banana` or `place:cup:basket_a`
+  - logs parsed structure clearly
+  - forwards `object` to detection
+  - forwards staged requests to grasp and motion after downstream results
 - **File**: `team01_solution/instruction_parser.py`
+
+#### `detection_node`
+- **Purpose**: placeholder detection stage
+- **Subscription**: `/detect_request` (std_msgs/String)
+- **Publication**: `/detect_result` (std_msgs/String)
+- **Behavior**: logs request and publishes a dummy result like `banana_detected`
+- **File**: `team01_solution/detection_node.py`
+
+#### `grasp_node`
+- **Purpose**: placeholder grasp stage
+- **Subscription**: `/grasp_request` (std_msgs/String)
+- **Publication**: `/grasp_result` (std_msgs/String)
+- **Behavior**: logs request and publishes a dummy result like `pick:banana_grasped`
+- **File**: `team01_solution/grasp_node.py`
+
+#### `motion_node`
+- **Purpose**: placeholder motion execution stage
+- **Subscription**: `/motion_request` (std_msgs/String)
+- **Publication**: `/motion_result` (std_msgs/String)
+- **Behavior**: logs request and publishes a dummy result `motion_done`
+- **File**: `team01_solution/motion_node.py`
 
 ### Launch Files
 
 #### 1. **standby.launch.py**
-- Launches only the standby_node
-- Used for basic system initialization
+- Launches `standby_node` and `instruction_parser`
+- Used for system startup plus pipeline orchestration
 - Command: `ros2 launch team01_solution standby.launch.py`
 
 #### 2. **integration_test.launch.py**
-- Launches both standby_node and instruction_parser
-- Used for testing ROS topic communication
+- Launches the full pipeline:
+  - `standby_node`
+  - `instruction_parser`
+  - `detection_node`
+  - `grasp_node`
+  - `motion_node`
+- Used for end-to-end Phase 2 integration testing
 - Command: `ros2 launch team01_solution integration_test.launch.py`
 
 ## Building
@@ -64,7 +125,7 @@ ros2 launch team01_solution standby.launch.py
 ros2 launch team01_solution integration_test.launch.py
 
 # Terminal 2: Publish test instruction
-ros2 topic pub /instruction std_msgs/msg/String "{data: 'pick banana'}"
+ros2 topic pub /instruction std_msgs/msg/String "{data: 'pick:banana'}"
 ```
 
 ### Expected Output:
