@@ -7,10 +7,19 @@
   <maintainer email="camille@kaist.ac.kr">cam</maintainer>
   <license>Apache-2.0</license>
 
-  <!-- Runtime dependencies -->
-  <depend>rclpy</depend>
-  <depend>std_msgs</depend>
-  <depend>launch_ros</depend>
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <build_depend>team01_solution_msgs</build_depend>
+  <build_depend>rclpy</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>launch_ros</build_depend>
+
+  <exec_depend>team01_solution_msgs</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
 
   <!-- Testing dependencies -->
   <test_depend>ament_copyright</test_depend>
