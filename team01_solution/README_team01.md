@@ -1,172 +1,157 @@
-# Team 01 Solution - PHASE 3
+# Team 01 Solution - PHASE 4
 
 ## Overview
 
-This package implements the Phase 3 infrastructure for the CS477 robotics integration challenge. It extends the Phase 2 pipeline with structured ROS interfaces, a central task execution state machine, error handling, and a system state publisher. Custom ROS interface types are provided by the companion package `team01_solution_msgs`.
+This package provides the Phase 4 ROS2 launch and integration layer for the CS477 robotics picking challenge. The focus is on clean startup orchestration, reusable launch composition, and a verified one-command integration test path.
 
-## Phase 3 Architecture
+## Launch architecture
 
-The system remains message-driven and modular, with clearly separated stages and no direct Python imports between nodes.
+The integration stack is organized so that:
+- `integration_test.launch.py` is a parent launcher only
+- child launch files instantiate nodes inside namespaces
+- duplicate node creation is avoided
+- Gazebo is optional and controlled with a launch argument
 
+### Launch files
+
+- `launch/integration_test.launch.py`
+  - parent orchestrator for the full stack
+  - includes Gazebo, standby, perception, and planning launches
+  - delays system node startup until after simulation startup
+
+- `launch/gazebo.launch.py`
+  - starts the `manip_challenge` UR5 Gazebo environment
+  - controlled by `enable_gazebo`
+
+- `launch/standby.launch.py`
+  - starts the standby system under namespace `/standby`
+  - launches `standby_node` and `instruction_parser`
+  - supports `enable_parser`
+
+- `launch/perception.launch.py`
+  - starts the perception node under namespace `/perception`
+  - launches `detection_node`
+
+- `launch/planning.launch.py`
+  - starts planning nodes under namespace `/planning`
+  - launches `grasp_node` and `motion_node`
+
+## Verified node graph
+
+The clean runtime graph should contain only:
+
+```text
+/standby/standby_node
+/standby/instruction_parser
+/perception/detection_node
+/planning/grasp_node
+/planning/motion_node
 ```
-/instruction (std_msgs/String, JSON)
-        |
-        v
-instruction_parser
-       _|____________________________
-      /              |               \
-     v               v                v
-/detect_request   /grasp_request   /motion_request
-      (team01_solution_msgs/Task)      (team01_solution_msgs/Task)      (team01_solution_msgs/Task)
-     |               |                |
-     v               v                v
- detection_node    grasp_node     motion_node
-     |               |                |
-     v               v                v
-/detect_result   /grasp_result   /motion_result
-      (team01_solution_msgs/DetectionResult) (team01_solution_msgs/GraspResult) (team01_solution_msgs/MotionResult)
-        \             |              /
-         -------------v-------------
-                   parser
-                     |
-                     v
-               /system_state
-              (team01_solution_msgs/SystemState)
-```
 
-### Node responsibilities
+This avoids duplicate global nodes such as `/detection_node`, `/grasp_node`, `/motion_node`, `/standby_node`, or `/instruction_parser`.
 
-#### `standby_node`
-- **Purpose**: system startup readiness
-- **Subscriptions**: none
-- **Publications**: none
-- **Behavior**: logs "System is in standby mode." and stays alive
-- **File**: `team01_solution/standby_node.py`
+## Example commands
 
-#### `instruction_parser`
-- **Purpose**: central task manager and FSM orchestrator
-- **Subscriptions**:
-  - `/instruction` (std_msgs/String)
-  - `/detect_result` (team01_solution/DetectionResult)
-  - `/grasp_result` (team01_solution/GraspResult)
-  - `/motion_result` (team01_solution/MotionResult)
-- **Publications**:
-  - `/detect_request` (team01_solution/Task)
-  - `/grasp_request` (team01_solution/Task)
-  - `/motion_request` (team01_solution/Task)
-  - `/system_state` (team01_solution/SystemState)
-- **Behavior**:
-  - parses JSON instructions safely
-  - validates `tasks[0]` with required `item`
-  - tracks a single active task
-  - enforces explicit states: IDLE, WAITING_FOR_DETECTION, WAITING_FOR_GRASP, WAITING_FOR_MOTION, TASK_COMPLETE, TASK_FAILED
-  - retries failed stages once before failing
-  - logs every state transition clearly
-- **File**: `team01_solution/instruction_parser.py`
+### Build
 
-#### `detection_node`
-- **Purpose**: placeholder detection stage
-- **Subscription**: `/detect_request` (team01_solution/Task)
-- **Publication**: `/detect_result` (team01_solution/DetectionResult)
-- **Behavior**: logs request, simulates detection success/failure, publishes dummy pose
-- **File**: `team01_solution/detection_node.py`
-
-#### `grasp_node`
-- **Purpose**: placeholder grasp stage
-- **Subscription**: `/grasp_request` (team01_solution/Task)
-- **Publication**: `/grasp_result` (team01_solution/GraspResult)
-- **Behavior**: logs request, simulates grasp success/failure, publishes dummy grasp pose
-- **File**: `team01_solution/grasp_node.py`
-
-#### `motion_node`
-- **Purpose**: placeholder motion execution stage
-- **Subscription**: `/motion_request` (team01_solution/Task)
-- **Publication**: `/motion_result` (team01_solution/MotionResult)
-- **Behavior**: logs request, simulates motion success/failure, publishes status string
-- **File**: `team01_solution/motion_node.py`
-
-### Launch Files
-
-#### 1. **standby.launch.py**
-- Launches `standby_node` and `instruction_parser`
-- Used for system startup plus pipeline orchestration
-- Command: `ros2 launch team01_solution standby.launch.py`
-
-#### 2. **integration_test.launch.py**
-- Launches the full pipeline:
-  - `standby_node`
-  - `instruction_parser`
-  - `detection_node`
-  - `grasp_node`
-  - `motion_node`
-- Used for end-to-end Phase 3 integration testing
-- Command: `ros2 launch team01_solution integration_test.launch.py`
-
-## Building
-
-### Build the package only:
 ```bash
-cd ~/cs477_ws_project
-colcon build --packages-select team01_solution --symlink-install --parallel-workers 1
-```
-
-### Build with dependencies (if needed):
-```bash
-cd ~/cs477_ws_project
-colcon build --symlink-install --parallel-workers 1
-```
-
-## Testing
-
-### 1. Source the workspace:
-```bash
+cd /home/cam/cs477_ws_project
+rm -rf build install log
+colcon build --packages-select team01_solution_msgs team01_solution --symlink-install
 source install/setup.bash
 ```
 
-### 2. Test standby launch:
+### Standby-only launch
+
 ```bash
 ros2 launch team01_solution standby.launch.py
 ```
 
-### 3. Test instruction parser (in separate terminal):
+### Full integration launch without Gazebo
+
 ```bash
-# Terminal 1: Launch all pipeline nodes
+ros2 launch team01_solution integration_test.launch.py enable_gazebo:=false
+```
+
+### Full integration launch with Gazebo
+
+```bash
 ros2 launch team01_solution integration_test.launch.py
-
-# Terminal 2: Publish JSON task instruction
-ros2 topic pub /instruction std_msgs/msg/String "{data: '{\"tasks\": [{\"item\": \"banana\", \"target\": \"basket_a\"}] }'}"
 ```
 
-### Expected Output:
-In Terminal 1, you should see logs similar to:
-```
-[instruction_parser-2] Transitioned to WAITING_FOR_DETECTION: task_id=...
-[instruction_parser-2] Published /detect_request for item=banana
-[detection_node-3] Received /detect_request item_id=banana target=basket_a
-[instruction_parser-2] Received /detect_result(task=banana, success=True, confidence=0.82)
-[instruction_parser-2] Transitioned to WAITING_FOR_GRASP: detection succeeded
-[instruction_parser-2] Published /grasp_request for item=banana
-[grasp_node-4] Received /grasp_request item_id=banana target=basket_a
-[instruction_parser-2] Received /grasp_result(task=banana, success=True)
-[instruction_parser-2] Transitioned to WAITING_FOR_MOTION: grasp succeeded
-[instruction_parser-2] Published /motion_request for item=banana
-[motion_node-5] Received /motion_request item_id=banana target=basket_a
-[instruction_parser-2] Received /motion_result(success=True, status=motion_done)
-[instruction_parser-2] Transitioned to TASK_COMPLETE: motion succeeded
+### Debug mode
+
+```bash
+ros2 launch team01_solution integration_test.launch.py debug:=true
 ```
 
-### Monitor system state:
+## Launch arguments
+
+- `use_sim_time` — use simulation time for launched nodes
+- `enable_gazebo` — start the Gazebo simulation environment
+- `enable_parser` — launch the instruction parser in standby
+- `enable_perception` — launch the perception node
+- `enable_motion` — launch the planning nodes
+- `debug` — enable verbose launch logging
+
+## Runtime validation
+
+1. Source the workspace:
+
+```bash
+source install/setup.bash
+```
+
+2. Run the integration launcher without Gazebo:
+
+```bash
+ros2 launch team01_solution integration_test.launch.py enable_gazebo:=false debug:=true
+```
+
+3. Verify the node graph:
+
+```bash
+ros2 node list
+```
+
+Expected nodes:
+
+```text
+/standby/standby_node
+/standby/instruction_parser
+/perception/detection_node
+/planning/grasp_node
+/planning/motion_node
+```
+
+4. Publish a test instruction from a second terminal:
+
+```bash
+ros2 topic pub -1 /instruction std_msgs/msg/String "{data: '{\"tasks\": [{\"item\": \"banana\", \"target\": \"basket_a\"}] }'}"
+```
+
+5. Monitor system state:
+
 ```bash
 ros2 topic echo /system_state
 ```
 
-## Package Structure
+## Build status
+
+- `team01_solution_msgs` and `team01_solution` build cleanly
+- launch files compile and run successfully
+- namespaced child launch files remove duplicate node instantiation
+
+## Package structure
 
 ```
 team01_solution/
 ├── launch/
-│   ├── standby.launch.py           # Standby system launch
-│   └── integration_test.launch.py  # Full integration test launch
+│   ├── standby.launch.py
+│   ├── integration_test.launch.py
+│   ├── gazebo.launch.py
+│   ├── perception.launch.py
+│   └── planning.launch.py
 ├── msg/
 │   ├── Task.msg
 │   ├── DetectionResult.msg
@@ -174,23 +159,27 @@ team01_solution/
 │   ├── MotionResult.msg
 │   └── SystemState.msg
 ├── team01_solution/
-│   ├── __init__.py                 # Package marker
-│   ├── standby_node.py             # Standby initialization node
-│   ├── instruction_parser.py       # Task manager / FSM node
-│   ├── detection_node.py           # Placeholder detection stage
-│   ├── grasp_node.py               # Placeholder grasp stage
-│   └── motion_node.py              # Placeholder motion stage
-├── config/                          # Configuration files (empty - for future use)
-├── resource/                        # Resource files (empty - for future use)
-├── setup.py                         # Package setup and entry points
-├── setup.cfg                        # Setup configuration
-├── package.xml                      # ROS2 package metadata
-├── CMakeLists.txt                   # ROS2 interface generation
-└── README_team01.md                 # This file
+│   ├── __init__.py
+│   ├── standby_node.py
+│   ├── instruction_parser.py
+│   ├── detection_node.py
+│   ├── grasp_node.py
+│   └── motion_node.py
+├── setup.py
+├── setup.cfg
+├── package.xml
+├── CMakeLists.txt
+└── README_team01.md
 ```
+
+## Notes
+
+- This phase focuses on launch/integration infrastructure only.
+- Placeholder perception and planning nodes remain unchanged.
+- Child launch files are responsible for node instantiation; the parent integration launch only includes them.
 
 ## Dependencies
 
-- **rclpy**: ROS2 Python client library
-- **std_msgs**: Standard ROS2 message types
-- **launch_ros**: ROS2 launch system
+- `rclpy`
+- `std_msgs`
+- `launch_ros`
