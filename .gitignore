@@ -27,3 +27,5 @@ __pycache__
 # specific repo
 ###############
 *.egg-info/
+image_team_1.tar.gz
+image_team_1.tar.xz
