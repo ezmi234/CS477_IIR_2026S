@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os
 from glob import glob
-from setuptools import setup
+from setuptools import setup, find_packages
 from pathlib import Path
     
 package_name = 'manip_challenge'
@@ -34,7 +34,7 @@ def package_files(data_files, directory_list):
 setup(
     name=package_name,
     version='0.0.1',
-    packages=[package_name],
+    packages=find_packages(exclude=["test"]),
     data_files=package_files(data_files, ['data/models/', 'launch/', 'data/worlds/', 'config']),
     install_requires=[
         'setuptools',
@@ -63,6 +63,9 @@ setup(
             'get_pose     = manip_challenge.get_pose:main',            
             'move_gripper = manip_challenge.move_gripper:main',
             'move_joint   = manip_challenge.move_joint:main',            
+            'vision_server = manip_challenge.vision.vision_server:main',
+            'vision_client = manip_challenge.vision.vision_client:main',
+            'vision_snapshot_collector = manip_challenge.vision.snapshot_collector:main',
             ],
     },
 )

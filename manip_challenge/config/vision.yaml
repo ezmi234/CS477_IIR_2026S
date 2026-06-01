@@ -1,0 +1,28 @@
+vision_server:
+  ros__parameters:
+    service_name: "detect_objects_with_prompt"
+
+    # For ur5_setup_set2_picking.launch.py the global camera topics are /camera/camera/...
+    preferred_camera: "top"
+    camera_names: ["top", "wrist"]
+
+    top_rgb_topic: "/camera/camera/color/image_raw"
+    top_cloud_topic: "/camera/camera/depth/color/points"
+
+    wrist_rgb_topic: "/wrist_camera/wrist_camera/color/image_raw"
+    wrist_cloud_topic: "/wrist_camera/wrist_camera/depth/color/points"
+
+    # Start with depth for integration. Later switch to ["hf_owlvit", "depth"],
+    # then eventually ["yolo", "hf_owlvit", "depth"] after training your own YOLO.
+    backend_order: ["hf_owlvit"]
+
+    max_camera_age_sec: 30.0
+    debug: true
+
+    # Optional Hugging Face backend. Keep CPU first to avoid CUDA/PyTorch issues.
+    device: "cpu"
+    hf_model_id: "google/owlvit-base-patch32"
+    hf_score_threshold: 0.05
+
+    # Depth fallback params.
+    depth_min_area: 250
