@@ -63,6 +63,8 @@ setup(
             'get_pose     = manip_challenge.get_pose:main',            
             'move_gripper = manip_challenge.move_gripper:main',
             'move_joint   = manip_challenge.move_joint:main',            
+            'motion_node = manip_challenge.motion.motion_node:main',
+            # 'demo_motion_pipeline = manip_challenge.motion.demo_motion_pipeline:main',
             ],
     },
 )

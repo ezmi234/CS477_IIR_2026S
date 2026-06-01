@@ -1,0 +1,10 @@
+targets:
+  storage_box_a:
+    position: [0.55, -0.25, 0.18]
+    orientation_xyzw: [0.7071, 0.7071, 0.0, 0.0]
+  storage_box_b:
+    position: [0.55, 0.25, 0.18]
+    orientation_xyzw: [0.7071, 0.7071, 0.0, 0.0]
+  bookshelf:
+    position: [0.70, 0.00, 0.35]
+    orientation_xyzw: [0.7071, 0.7071, 0.0, 0.0]
