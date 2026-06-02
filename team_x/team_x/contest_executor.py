@@ -25,7 +25,14 @@ from .pose_providers import (
     HardcodedPoseProvider,
     VisionPoseProvider,
 )
-from .task_parser import parse_task_command, prioritize_tasks
+from .scene_snapshot import (
+    SceneSnapshot,
+    annotate_blocking,
+    format_snapshot_summary,
+    scene_object_from_probe,
+)
+from .task_parser import parse_task_command
+from .task_planner import TaskPlanner
 
 
 class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
@@ -47,6 +54,10 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.declare_parameter('grasp_z_offset', -0.015)
         self.declare_parameter('ground_truth_z_offset', -0.37)
         self.declare_parameter('move_duration', 4.0)
+        self.declare_parameter('task_planner', 'adaptive')
+        self.declare_parameter('max_task_retries', 1)
+        self.declare_parameter('scene_snapshot_enabled', True)
+        self.declare_parameter('scene_overlap_threshold', 0.08)
 
         self.command_queue = deque()
         self.task_queue = deque()
@@ -55,6 +66,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.state = ExecutorState.STANDBY
         self.current_command = None
         self.current_parsed_tasks = []
+        self.current_scene_snapshot = None
         self.current_task = None
         self.current_object_pose = None
         self.current_pick_plan = None
@@ -105,7 +117,9 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.arm_kdl = self.create_arm_kdl()
         self.tool_offset_frame = misc.list2KDLframe([0.15, 0.003, 0, 1.5707, 0, 1.5707])
         self.pose_provider = self.create_pose_provider()
+        self.task_planner = TaskPlanner.from_node(self)
         self.get_logger().info(f'Pose provider: {self.pose_provider_name}')
+        self.get_logger().info(f'Task planner: {self.task_planner.describe()}')
 
         auto_command = self.get_parameter('auto_start_command').value
         if auto_command:
@@ -203,7 +217,11 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             return
 
         if self.state == ExecutorState.BUILD_TASK_QUEUE:
-            tasks = prioritize_tasks(self.current_parsed_tasks)
+            self.current_scene_snapshot = self.build_scene_snapshot(self.current_parsed_tasks)
+            tasks = self.task_planner.order_initial_tasks(
+                self.current_parsed_tasks,
+                snapshot=self.current_scene_snapshot,
+            )
             self.task_queue.extend(tasks)
             task_labels = [task.label() for task in tasks]
             self.get_logger().info(
@@ -237,10 +255,25 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 self.current_task.object_name
             )
             if self.current_object_pose is None:
-                self.get_logger().error(
-                    f'Skipping {self.current_task.object_name}: pose provider failed.'
-                )
-                self.finish_task(success=False)
+                if self.task_planner.should_defer_pose_failure(
+                    self.current_task,
+                    len(self.task_queue),
+                ):
+                    deferred = self.task_planner.defer_failed_task(self.current_task)
+                    self.task_queue.append(deferred)
+                    self.get_logger().warn(
+                        'Pose provider failed; deferring task for replanning: '
+                        f'{self.current_task.label()} '
+                        f'(attempt {self.current_task.attempt + 1}/'
+                        f'{self.task_planner.max_task_retries + 1}). '
+                        f'Queue depth: {len(self.task_queue)}'
+                    )
+                    self.clear_current_task()
+                else:
+                    self.get_logger().error(
+                        f'Skipping {self.current_task.object_name}: pose provider failed.'
+                    )
+                    self.finish_task(success=False)
                 self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
                 return
             if not self.is_reachable_pick_pose(self.current_object_pose):
@@ -299,6 +332,46 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
 
         raise RuntimeError(f'Unhandled FSM state: {self.state}')
 
+    def build_scene_snapshot(self, tasks):
+        if not self.get_parameter('scene_snapshot_enabled').value:
+            return None
+        if self.pose_provider_name != 'vision':
+            return None
+        if len(tasks) <= 1:
+            return None
+
+        objects = {}
+        for task in tasks:
+            if task.object_name in objects:
+                continue
+            try:
+                pose = self.pose_provider.get_object_pose(task.object_name)
+                detection_json = getattr(self.pose_provider, 'latest_detection_json', '')
+                objects[task.object_name] = scene_object_from_probe(
+                    task.object_name,
+                    pose,
+                    detection_json,
+                )
+            except Exception as exc:
+                self.get_logger().warn(
+                    f'Scene snapshot probe failed for {task.object_name}: {exc}'
+                )
+                objects[task.object_name] = scene_object_from_probe(
+                    task.object_name,
+                    None,
+                    '',
+                )
+
+        snapshot = SceneSnapshot(objects=objects)
+        annotate_blocking(
+            snapshot,
+            overlap_threshold=float(self.get_parameter('scene_overlap_threshold').value),
+        )
+        self.get_logger().info(f'Scene snapshot: {format_snapshot_summary(snapshot)}')
+        for note in snapshot.notes[:3]:
+            self.get_logger().warn(f'Scene snapshot note: {note}')
+        return snapshot
+
     def execute_next_task(self):
         self.run_fsm_once()
 
@@ -337,6 +410,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
 
         self.current_command = None
         self.current_parsed_tasks = []
+        self.current_scene_snapshot = None
         self.get_logger().info('FSM done. Standby: waiting for /task_commands')
         self.transition_to(ExecutorState.STANDBY)
 

@@ -35,6 +35,10 @@ def generate_launch_description():
     preferred_camera = LaunchConfiguration('preferred_camera')
     camera_selection_mode = LaunchConfiguration('camera_selection_mode')
     use_sim_time = LaunchConfiguration('use_sim_time')
+    task_planner = LaunchConfiguration('task_planner')
+    max_task_retries = LaunchConfiguration('max_task_retries')
+    scene_snapshot_enabled = LaunchConfiguration('scene_snapshot_enabled')
+    scene_overlap_threshold = LaunchConfiguration('scene_overlap_threshold')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -122,6 +126,26 @@ def generate_launch_description():
             default_value='true',
             description='Use Gazebo simulation time.',
         ),
+        DeclareLaunchArgument(
+            'task_planner',
+            default_value='adaptive',
+            description='Task planner mode: adaptive, command_order, or priority.',
+        ),
+        DeclareLaunchArgument(
+            'max_task_retries',
+            default_value='1',
+            description='Times to defer a failed perception task while other tasks remain.',
+        ),
+        DeclareLaunchArgument(
+            'scene_snapshot_enabled',
+            default_value='true',
+            description='Probe task objects before multi-task execution for visibility/blocking cues.',
+        ),
+        DeclareLaunchArgument(
+            'scene_overlap_threshold',
+            default_value='0.08',
+            description='BBox overlap ratio used to infer blocking in scene snapshots.',
+        ),
         Node(
             package='team_x',
             executable='vision_server',
@@ -166,6 +190,10 @@ def generate_launch_description():
                 'vision_detection_topic': vision_detection_topic,
                 'vision_pose_timeout': vision_pose_timeout,
                 'vision_fallback_frame': vision_fallback_frame,
+                'task_planner': task_planner,
+                'max_task_retries': max_task_retries,
+                'scene_snapshot_enabled': scene_snapshot_enabled,
+                'scene_overlap_threshold': scene_overlap_threshold,
             }],
         ),
     ])

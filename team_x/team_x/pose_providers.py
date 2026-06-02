@@ -56,7 +56,7 @@ class GroundTruthPoseProvider(PoseProvider):
         request = StringPose.Request()
         request.data = object_name
         future = self.client.call_async(request)
-        rclpy.spin_until_future_complete(self.node, future, timeout_sec=5.0)
+        rclpy.spin_until_future_complete(self.node, future, timeout_sec=15.0)
         if not future.done() or future.result() is None:
             return None
 

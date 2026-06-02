@@ -96,20 +96,26 @@ class PickPlaceMixin:
             y = y_sign * float(override['slot_y_abs'])
         else:
             x, y = self.storage_slot(config, count)
-        if override.get('release_z_from_grasp', False):
+        release_z_from_grasp = bool(
+            override.get('release_z_from_grasp', config.get('release_z_from_grasp', False))
+        )
+        if release_z_from_grasp:
             grasp_pose = pick_info.get('grasp_pose')
             grasp_z = grasp_pose.position.z if grasp_pose is not None else 0.0
             release_z = (
-                float(override.get('storage_base_z', 0.06))
+                float(override.get('storage_base_z', config.get('storage_base_z', 0.06)))
                 + float(grasp_z)
-                + float(override.get('object_clearance_z', 0.15))
+                + float(override.get('object_clearance_z', config.get('object_clearance_z', 0.15)))
             )
         else:
             release_z = float(override.get('release_z', config['release_z']))
         approach_z = float(override.get('approach_z', config['approach_z']))
         retreat_z = float(override.get('retreat_z', config['retreat_z']))
         release = self.make_tool_pose(x, y, release_z)
-        if override.get('use_grasp_orientation', False) and pick_info.get('grasp_pose') is not None:
+        use_grasp_orientation = bool(
+            override.get('use_grasp_orientation', config.get('use_grasp_orientation', False))
+        )
+        if use_grasp_orientation and pick_info.get('grasp_pose') is not None:
             release.orientation = copy.deepcopy(pick_info['grasp_pose'].orientation)
         approach = copy.deepcopy(release)
         approach.position.z += approach_z
@@ -127,11 +133,11 @@ class PickPlaceMixin:
             0.0,
         ]
         rot_time = calc_rot_time(current_pan, place_pan_angle)
-        approach_duration = float(override.get('approach_duration', 1.5))
-        release_duration = float(override.get('release_duration', 1.0))
-        open_timeout = int(math.ceil(float(override.get('open_timeout', 1.0))))
-        post_release_sleep = float(override.get('post_release_sleep', 0.0))
-        retreat_duration = float(override.get('retreat_duration', 1.0))
+        approach_duration = float(override.get('approach_duration', config.get('approach_duration', 1.5)))
+        release_duration = float(override.get('release_duration', config.get('release_duration', 1.0)))
+        open_timeout = int(math.ceil(float(override.get('open_timeout', config.get('open_timeout', 2.5)))))
+        post_release_sleep = float(override.get('post_release_sleep', config.get('post_release_sleep', 0.8)))
+        retreat_duration = float(override.get('retreat_duration', config.get('retreat_duration', 1.0)))
 
         self.get_logger().info(
             f'Place {object_name} in {destination}: '
@@ -183,11 +189,25 @@ class PickPlaceMixin:
             max_time=2.5,
         )
 
-        self.execute_trajectory([place_joint, approach, release], durations=[rot_time, 1.5, 1.0])
-        move_gripper.gripper_open(self, timeout=2)
-        time.sleep(0.8)
+        approach_duration = float(config.get('approach_duration', 1.5))
+        release_duration = float(config.get('release_duration', 1.0))
+        open_timeout = int(math.ceil(float(config.get('open_timeout', 2.0))))
+        post_release_sleep = float(config.get('post_release_sleep', 0.8))
+        retreat_duration = float(config.get('retreat_duration', 1.8))
+
+        self.get_logger().info(
+            f'Place {object_name} on shelf: '
+            f'x={release.position.x:.3f}, y={release.position.y:.3f}, z={release.position.z:.3f}'
+        )
+        self.execute_trajectory(
+            [place_joint, approach, release],
+            durations=[rot_time, approach_duration, release_duration],
+        )
+        move_gripper.gripper_open(self, timeout=open_timeout)
+        if post_release_sleep > 0.0:
+            time.sleep(post_release_sleep)
         retreat.position.z += config['retreat_lift_z']
-        self.move_tool_pose(retreat, duration=1.8)
+        self.move_tool_pose(retreat, duration=retreat_duration)
         self.place_counts['shelf'] = count + 1
 
     def storage_slot(self, config, count):

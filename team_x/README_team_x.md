@@ -110,8 +110,31 @@ ros2 launch team_x contest_run.launch.py \
   start_vision:=true \
   pose_provider:=vision \
   preferred_camera:=top \
-  camera_selection_mode:=all
+  camera_selection_mode:=all \
+  task_planner:=adaptive \
+  scene_snapshot_enabled:=true
 ```
+
+Task planner modes:
+
+- `adaptive`: default. Keeps command order when perception works, but defers a
+  failed/occluded task while other tasks remain, then retries after the scene has
+  changed.
+- `command_order`: disables replanning and executes exactly in parsed order.
+- `priority`: applies object priority before execution, then uses the same
+  adaptive retry behavior.
+
+Scene snapshot:
+
+- Enabled by default for multi-task commands when `pose_provider:=vision`.
+- Before building the task queue, the executor probes each requested object,
+  records visibility, bbox, camera depth, and score, then infers simple
+  `blocked_by` relations from bbox overlap and depth order.
+- If a requested target appears blocked by another requested target, the visible
+  blocker is scheduled first. If snapshot probing fails, execution falls back to
+  the normal command-order behavior.
+- Disable with `scene_snapshot_enabled:=false` if you want the previously
+  validated queue behavior only.
 
 Debug-only arguments:
 
