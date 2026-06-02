@@ -3,6 +3,7 @@ import time
 
 import numpy as np
 import rclpy
+import tf2_geometry_msgs  # noqa: F401 - registers PoseStamped transforms with tf2.
 import xacro
 from ament_index_python.packages import get_package_share_directory
 from assignment_1 import misc
@@ -12,7 +13,7 @@ from geometry_msgs.msg import Pose, PoseStamped
 from hrl_geom.pose_converter import PoseConv
 from pykdl_utils.kdl_kinematics import create_kdl_kin
 from rosidl_runtime_py import message_to_yaml
-from tf2_ros import TransformException
+from tf2_ros import TransformException, TypeException
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .config import HOME_JOINTS, IK_SEEDS, JOINT_NAMES, REFERENCE_GRASP_JOINTS
@@ -98,7 +99,7 @@ class MotionMixin:
                 f'z={transformed.pose.position.z:.3f}'
             )
             return transformed.pose
-        except TransformException as exc:
+        except (TransformException, TypeException) as exc:
             self.get_logger().error(f'TF transform failed: {exc}')
             return None
 
