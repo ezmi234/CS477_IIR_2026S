@@ -11,12 +11,18 @@ def generate_launch_description():
     config_file = os.path.join(pkg_share, 'config', 'vision.yaml')
 
     preferred_camera = LaunchConfiguration('preferred_camera')
+    camera_selection_mode = LaunchConfiguration('camera_selection_mode')
 
     return LaunchDescription([
         DeclareLaunchArgument(
             'preferred_camera',
             default_value='top',
             description='Camera to try first: top or wrist.'
+        ),
+        DeclareLaunchArgument(
+            'camera_selection_mode',
+            default_value='all',
+            description='Camera policy: preferred_only, preferred_then_others, or all.'
         ),
         Node(
             package='manip_challenge',
@@ -26,6 +32,7 @@ def generate_launch_description():
             parameters=[
                 config_file,
                 {'preferred_camera': preferred_camera},
+                {'camera_selection_mode': camera_selection_mode},
                 {'use_sim_time': True},
             ],
         ),

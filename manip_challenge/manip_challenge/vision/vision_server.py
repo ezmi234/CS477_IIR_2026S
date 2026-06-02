@@ -25,7 +25,7 @@ from std_msgs.msg import String
 from riro_srvs.srv import StringPose
 
 from .backends import make_backend
-from .labels import extract_target_label, normalize_label
+from .labels import canonical_aliases_for_log, extract_target_label, normalize_label
 from .types import CameraState, Detection
 from .visualization import draw_detections
 
@@ -48,8 +48,14 @@ class VisionServer(Node):
         self.declare_parameter("service_name", "detect_objects_with_prompt")
         self.declare_parameter("preferred_camera", "top")
         self.declare_parameter("camera_names", ["top", "wrist"])
+        # Camera selection mode:
+        #   preferred_only      -> use only preferred_camera. Useful for fixed-frame global perception.
+        #   preferred_then_others -> try preferred first, then fallback cameras.
+        #   all                 -> run detection on all ready cameras and select the best scored result.
+        self.declare_parameter("camera_selection_mode", "all")
         self.declare_parameter("max_camera_age_sec", 30.0)
         self.declare_parameter("backend_order", ["depth"])
+        self.declare_parameter("min_return_score", 0.03)
         self.declare_parameter("device", "cpu")
         self.declare_parameter("hf_model_id", "google/owlvit-base-patch32")
         self.declare_parameter("hf_score_threshold", 0.08)
@@ -65,7 +71,9 @@ class VisionServer(Node):
         self.service_name = self.get_parameter("service_name").value
         self.preferred_camera = str(self.get_parameter("preferred_camera").value)
         self.camera_names = [str(v) for v in self.get_parameter("camera_names").value]
+        self.camera_selection_mode = str(self.get_parameter("camera_selection_mode").value).strip().lower()
         self.max_camera_age_sec = float(self.get_parameter("max_camera_age_sec").value)
+        self.min_return_score = float(self.get_parameter("min_return_score").value)
         self.debug = bool(self.get_parameter("debug").value)
 
         self.bridge = CvBridge()
@@ -99,13 +107,15 @@ class VisionServer(Node):
 
         self.detections_pub = self.create_publisher(String, "/vision/detections", 10)
         self.pose_pub = self.create_publisher(PoseStamped, "/vision/selected_pose", 10)
+        self.selected_detection_pub = self.create_publisher(String, "/vision/selected_detection", 10)
         self.debug_image_pub = self.create_publisher(Image, "/vision/debug_image", 10)
 
         self.status_timer = self.create_timer(2.0, self.log_camera_status)
 
         self.get_logger().info(
             f"Vision server ready. service=/{self.service_name}, "
-            f"backend_order={[b.name for b in self.backends]}, preferred_camera={self.preferred_camera}"
+            f"backend_order={[b.name for b in self.backends]}, "
+            f"preferred_camera={self.preferred_camera}, camera_selection_mode={self.camera_selection_mode}"
         )
 
     def image_callback(self, camera_name: str, msg: Image):
@@ -124,18 +134,31 @@ class VisionServer(Node):
     def now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
-    def ready_cameras(self) -> list[CameraState]:
-        now = self.now_sec()
-        ordered_names = []
+    def ordered_camera_names(self) -> list[str]:
+        ordered_names: list[str] = []
         if self.preferred_camera in self.cameras:
             ordered_names.append(self.preferred_camera)
         ordered_names += [name for name in self.camera_names if name not in ordered_names]
+        return ordered_names
 
-        out = []
+    def ready_cameras(self) -> list[CameraState]:
+        now = self.now_sec()
+        ordered_names = self.ordered_camera_names()
+
+        # In preferred_only mode, the returned pose always has the same camera frame.
+        # This is useful when integrating with grasping code that expects a fixed frame.
+        if self.camera_selection_mode == "preferred_only":
+            state = self.cameras.get(self.preferred_camera)
+            return [state] if state is not None and state.ready(now, self.max_camera_age_sec) else []
+
+        out: list[CameraState] = []
         for name in ordered_names:
             state = self.cameras[name]
             if state.ready(now, self.max_camera_age_sec):
                 out.append(state)
+
+        # preferred_then_others keeps the same order as `all`; the difference is in
+        # selection logic below.
         return out
 
     def log_camera_status(self):
@@ -152,6 +175,10 @@ class VisionServer(Node):
         prompt = getattr(request, "data", "")
         target = extract_target_label(prompt, default="object")
         target = normalize_label(target)
+        aliases = canonical_aliases_for_log(target)
+        self.get_logger().info(
+            f"Vision request prompt={prompt!r} -> target='{target}' aliases={aliases}"
+        )
         cameras = self.ready_cameras()
 
         if not cameras:
@@ -162,26 +189,44 @@ class VisionServer(Node):
             return response
 
         all_detections: list[Detection] = []
-        selected: Detection | None = None
-        selected_cam: CameraState | None = None
+        camera_by_name = {cam.name: cam for cam in cameras}
 
         for cam in cameras:
             for backend in self.backends:
                 detections = backend.detect(cam.image_bgr, cam.cloud_msg, target, cam.name)
-                if detections:
-                    all_detections.extend(detections)
-                    selected = detections[0]
-                    selected_cam = cam
+                for det in detections:
+                    det.frame_id = cam.frame_id()
+                all_detections.extend(detections)
+
+                # Legacy mode: keep the old behavior, useful for quick fallback tests.
+                if self.camera_selection_mode == "preferred_then_others" and detections:
                     break
-            if selected is not None:
+
+            if self.camera_selection_mode == "preferred_then_others" and all_detections:
                 break
 
-        if selected is None:
+        # Sort globally. In `all` mode this lets the wrist camera win when it has
+        # a better semantic box, while still publishing the frame_id so downstream
+        # code knows how to transform the pose.
+        all_detections.sort(key=lambda d: d.effective_score(), reverse=True)
+        selected = all_detections[0] if all_detections else None
+        selected_cam = camera_by_name.get(selected.camera_name) if selected is not None else None
+
+        if selected is None or selected.effective_score() < self.min_return_score:
+            self.detections_pub.publish(String(data=json.dumps([d.to_dict() for d in all_detections])))
             response.pose = Pose()
-            text = f"No detection produced for target='{target}'."
+            if selected is None:
+                text = f"No detection produced for target='{target}' aliases={aliases}."
+            else:
+                text = (
+                    f"Best detection below min_return_score for target='{target}': "
+                    f"score={selected.effective_score():.3f}, threshold={self.min_return_score:.3f}"
+                )
             set_response_text(response, text)
             self.get_logger().warn(text)
             return response
+
+        selected.selected = True
 
         p = Pose()
         p.position.x = float(selected.center_xyz[0])
@@ -196,6 +241,8 @@ class VisionServer(Node):
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.pose = p
         self.pose_pub.publish(pose_msg)
+        selected_json = json.dumps(selected.to_dict())
+        self.selected_detection_pub.publish(String(data=selected_json))
 
         self.detections_pub.publish(String(data=json.dumps([d.to_dict() for d in all_detections])))
 
@@ -208,8 +255,10 @@ class VisionServer(Node):
                     self.get_logger().warn(f"Failed to publish debug image: {exc}")
 
         self.get_logger().info(
-            f"Selected target='{target}' camera={selected.camera_name} backend={selected.backend} "
-            f"score={selected.score:.3f} xyz={selected.center_xyz}"
+            f"Selected target='{target}' label={selected.label} query={selected.query_text!r} "
+            f"camera={selected.camera_name} frame={selected.frame_id!r} backend={selected.backend} "
+            f"score={selected.score:.3f} raw_score={selected.raw_score:.3f} "
+            f"rank_score={selected.effective_score():.3f} xyz={selected.center_xyz}"
         )
         return response
 

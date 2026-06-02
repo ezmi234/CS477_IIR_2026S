@@ -12,7 +12,7 @@ from typing import Optional
 
 import numpy as np
 
-from .labels import labels_for_detector, normalize_label
+from .labels import detector_queries_for_target, labels_for_detector, normalize_label
 from .pointcloud import median_xyz_in_bbox, median_xyz_in_mask, pointcloud2_to_xyz_image
 from .types import Detection
 
@@ -153,7 +153,12 @@ class OwlVitBackend:
         import cv2
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         pil = self.PILImage.fromarray(image_rgb)
-        texts = [labels_for_detector(target_label)]
+        queries = detector_queries_for_target(target_label)
+        if not queries:
+            return []
+
+        candidate_texts = [q.text for q in queries]
+        texts = [candidate_texts]
 
         inputs = self.processor(text=texts, images=pil, return_tensors="pt")
         if self.device == "cuda":
@@ -173,25 +178,70 @@ class OwlVitBackend:
         )[0]
 
         detections: list[Detection] = []
-        candidate_texts = texts[0]
+        h, w = image_bgr.shape[:2]
         for score, label_idx, box in zip(results["scores"], results["labels"], results["boxes"]):
             x1, y1, x2, y2 = [int(v) for v in box.detach().cpu().numpy().tolist()]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w - 1, x2), min(h - 1, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            # Reject huge boxes that usually correspond to the table/background.
+            box_area_ratio = float((x2 - x1) * (y2 - y1)) / float(max(1, h * w))
+            if box_area_ratio > 0.55:
+                continue
+
             center = median_xyz_in_bbox(xyz, (x1, y1, x2, y2))
             if center is None:
                 continue
+
             li = int(label_idx.detach().cpu().item())
-            label = normalize_label(target_label if li >= len(candidate_texts) else candidate_texts[li])
+            query = queries[li] if 0 <= li < len(queries) else None
+            raw_score = float(score.detach().cpu().item())
+            rank_weight = query.rank_weight if query else 0.75
+            rank_score = raw_score * rank_weight
+            canonical = query.canonical if query else normalize_label(target_label)
+            raw_label = candidate_texts[li] if 0 <= li < len(candidate_texts) else target_label
+
             detections.append(Detection(
-                label=label,
-                score=float(score.detach().cpu().item()),
+                label=canonical,
+                score=rank_score,
                 bbox_xyxy=(x1, y1, x2, y2),
                 center_xyz=center,
                 camera_name=camera_name,
                 backend=self.name,
+                query_text=query.text if query else raw_label,
+                raw_label=raw_label,
+                raw_score=raw_score,
+                rank_score=rank_score,
             ))
 
-        detections.sort(key=lambda d: d.score, reverse=True)
-        return detections
+        detections.sort(key=lambda d: d.rank_score if d.rank_score else d.score, reverse=True)
+        return _nms_detections(detections)
+
+
+def _iou_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = float(iw * ih)
+    if inter <= 0:
+        return 0.0
+    area_a = float(max(1, (ax2 - ax1) * (ay2 - ay1)))
+    area_b = float(max(1, (bx2 - bx1) * (by2 - by1)))
+    return inter / max(1.0, area_a + area_b - inter)
+
+
+def _nms_detections(detections: list[Detection], iou_threshold: float = 0.55, limit: int = 8) -> list[Detection]:
+    """Simple non-maximum suppression for overlapping zero-shot boxes."""
+    kept: list[Detection] = []
+    for det in detections:
+        if all(_iou_xyxy(det.bbox_xyxy, prev.bbox_xyxy) < iou_threshold for prev in kept):
+            kept.append(det)
+        if len(kept) >= limit:
+            break
+    return kept
 
 
 def make_backend(name: str, params: dict):

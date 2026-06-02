@@ -16,6 +16,16 @@ class Detection:
     center_xyz: tuple[float, float, float]
     camera_name: str
     backend: str
+    query_text: str = ""
+    raw_label: str = ""
+    raw_score: float = 0.0
+    rank_score: float = 0.0
+    frame_id: str = ""
+    selected: bool = False
+
+    def effective_score(self) -> float:
+        """Score used for final ranking across aliases/cameras."""
+        return float(self.rank_score if self.rank_score else self.score)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -36,3 +46,8 @@ class CameraState:
             now_sec - self.image_stamp_sec <= max_age_sec
             and now_sec - self.cloud_stamp_sec <= max_age_sec
         )
+
+    def frame_id(self) -> str:
+        if self.cloud_msg is not None:
+            return str(getattr(self.cloud_msg.header, "frame_id", ""))
+        return ""
