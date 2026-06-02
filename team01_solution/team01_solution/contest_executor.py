@@ -4,7 +4,7 @@ import time
 from collections import deque
 
 import rclpy
-from assignment_1 import misc
+from .motion_lib import misc
 from control_msgs.action import FollowJointTrajectory
 from control_msgs.msg import JointTrajectoryControllerState
 from rclpy.action import ActionClient
@@ -30,7 +30,7 @@ from .task_parser import parse_task_command, prioritize_tasks
 
 class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
     def __init__(self):
-        Node.__init__(self, 'team_0_contest_executor')
+        Node.__init__(self, 'team01_contest_executor')
 
         self.declare_parameter('auto_start_command', '')
         self.declare_parameter('detection_service', 'detect_objects_with_prompt')
@@ -133,32 +133,10 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         raise ValueError(f'Unknown pose_provider: {self.pose_provider_name}')
 
     def task_callback(self, msg):
-        command = msg.data.strip()
-        if not command:
-            return
-
-        # `ros2 topic pub` publishes repeatedly unless --once is used. During local
-        # testing this can flood the queue with identical tasks while the robot is
-        # executing the first one. The TA command is expected to be a single command,
-        # so ignoring exact duplicates while active is safer than building an
-        # unbounded queue.
-        if self.active and self.is_duplicate_runtime_command(command):
-            self.get_logger().warn(
-                'Ignoring duplicate /task_commands message while executing. '
-                'Use `ros2 topic pub --once ...` for local tests.'
-            )
-            return
-
         if self.active:
             self.get_logger().warn('Already executing; queued new command tasks.')
-        self.get_logger().info(f'Received task command: {command}')
-        self.queue_command(command, source='/task_commands')
-
-    def is_duplicate_runtime_command(self, command):
-        normalized = ' '.join(command.lower().split())
-        if self.current_command and ' '.join(self.current_command.lower().split()) == normalized:
-            return True
-        return any(' '.join(cmd.lower().split()) == normalized for cmd, _src in self.command_queue)
+        self.get_logger().info(f'Received task command: {msg.data}')
+        self.queue_command(msg.data, source='/task_commands')
 
     def transition_to(self, state):
         if self.state != state:

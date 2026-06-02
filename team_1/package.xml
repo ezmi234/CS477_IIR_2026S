@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>team_1</name>
+  <version>0.1.0</version>
+  <description>Compatibility launch package for Team 1. Runtime code lives in team01_solution.</description>
+  <maintainer email="team01@example.com">team01</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>team01_solution</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

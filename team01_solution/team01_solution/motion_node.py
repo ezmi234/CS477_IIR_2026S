@@ -15,7 +15,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Pose
 from team01_solution_msgs.msg import MotionResult, Task
 
-from assignment_2.move_joint import ArmClient
+from .motion_lib.assignment_2_legacy.move_joint import ArmClient
 from manip_challenge.move_gripper import gripper_close, gripper_open
 
 try:

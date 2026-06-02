@@ -2,28 +2,33 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>team01_solution</name>
-  <version>0.0.0</version>
-  <description>Team 01 solution for CS477 robotics integration challenge</description>
-  <maintainer email="camille@kaist.ac.kr">cam</maintainer>
+  <version>0.1.0</version>
+  <description>Integrated Team 01 solution for the CS477 IIR Picking Challenge.</description>
+  <maintainer email="team01@example.com">team01</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 
-  <build_depend>team01_solution_msgs</build_depend>
-  <build_depend>rclpy</build_depend>
-  <build_depend>std_msgs</build_depend>
-  <build_depend>geometry_msgs</build_depend>
-  <build_depend>launch_ros</build_depend>
-  <build_depend>moveit_py</build_depend>
-
-  <exec_depend>team01_solution_msgs</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>builtin_interfaces</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
-  <exec_depend>moveit_py</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+  <exec_depend>riro_srvs</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>manip_challenge</exec_depend>
+  <exec_depend>ur5_ros2_gazebo</exec_depend>
+  <exec_depend>pykdl_utils</exec_depend>
+  <exec_depend>hrl_geom</exec_depend>
+  <exec_depend>team01_solution_msgs</exec_depend>
 
-  <!-- Testing dependencies -->
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
