@@ -66,6 +66,8 @@ setup(
             'vision_server = manip_challenge.vision.vision_server:main',
             'vision_client = manip_challenge.vision.vision_client:main',
             'vision_snapshot_collector = manip_challenge.vision.snapshot_collector:main',
+            'motion_node = manip_challenge.motion.motion_node:main',
+            # 'demo_motion_pipeline = manip_challenge.motion.demo_motion_pipeline:main',
             ],
     },
 )

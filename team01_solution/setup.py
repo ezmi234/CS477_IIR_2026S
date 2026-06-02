@@ -30,6 +30,7 @@ setup(
             'detection_node = team01_solution.detection_node:main',
             'grasp_node = team01_solution.grasp_node:main',
             'motion_node = team01_solution.motion_node:main',
+            'motion_node_rrt = team01_solution.motion_node_rrt:main',
         ],
     },
 )
