@@ -1,1 +1,0 @@
-# cartpole_gazebo

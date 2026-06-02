@@ -1,6 +1,0 @@
-grasp:
-  ros__parameters:
-    pregrasp_dz: 0.12
-    grasp_dz: 0.01
-    lift_dz: 0.15
-    place_clearance_dz: 0.12
