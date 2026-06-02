@@ -14,11 +14,8 @@ ros2 daemon stop
 
 ## Common Environment
 
-Set `CS477_WS` to the workspace root used on the machine:
-
-```bash
-export CS477_WS=/path/to/cs477_ws
-```
+Run these debug commands from the ROS 2 workspace root after the workspace has
+been built.
 
 If a teammate uses a conda environment, activate it before sourcing ROS. If not,
 skip the conda line.
@@ -31,7 +28,6 @@ conda activate cs477
 Use this in each terminal:
 
 ```bash
-cd "$CS477_WS"
 source /opt/ros/humble/setup.bash
 source install/local_setup.bash
 ```
@@ -40,7 +36,6 @@ For simulator debugging, launching Gazebo outside conda is usually more stable.
 Open a clean shell without `conda activate`, then run:
 
 ```bash
-cd "$CS477_WS"
 source /opt/ros/humble/setup.bash
 source install/local_setup.bash
 ros2 launch manip_challenge ur5_setup_set2_picking.launch.py
@@ -78,7 +73,6 @@ Suggested edit targets:
 After changing code, run:
 
 ```bash
-cd "$CS477_WS"
 source /opt/ros/humble/setup.bash
 source install/local_setup.bash
 
@@ -91,7 +85,6 @@ colcon build --symlink-install --packages-select team_0
 Terminal 1: simulator.
 
 ```bash
-cd "$CS477_WS"
 source /opt/ros/humble/setup.bash
 source install/local_setup.bash
 ros2 launch manip_challenge ur5_setup_set2_picking.launch.py
@@ -100,7 +93,6 @@ ros2 launch manip_challenge ur5_setup_set2_picking.launch.py
 Terminal 2: Team 0 executor using Gazebo pose service.
 
 ```bash
-cd "$CS477_WS"
 source /opt/ros/humble/setup.bash
 source install/local_setup.bash
 
@@ -114,7 +106,6 @@ Terminal 3: publish commands.
 Single task:
 
 ```bash
-cd "$CS477_WS"
 source /opt/ros/humble/setup.bash
 source install/local_setup.bash
 
@@ -125,7 +116,6 @@ ros2 topic pub --once /task_commands std_msgs/msg/String \
 Multi-task:
 
 ```bash
-cd "$CS477_WS"
 source /opt/ros/humble/setup.bash
 source install/local_setup.bash
 
