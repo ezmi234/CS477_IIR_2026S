@@ -7,10 +7,16 @@ executes the tasks in order.
 
 ## Official Launch Procedure
 
+Set `CS477_WS` to the workspace root used on the machine:
+
+```bash
+export CS477_WS=/path/to/cs477_ws
+```
+
 Terminal 1: launch the simulator.
 
 ```bash
-cd ~/cs477_ws
+cd "$CS477_WS"
 source /opt/ros/humble/setup.bash
 source install/local_setup.bash
 
@@ -20,7 +26,7 @@ ros2 launch manip_challenge ur5_setup.launch.py
 Terminal 2: launch Team 0 in standby mode.
 
 ```bash
-cd ~/cs477_ws
+cd "$CS477_WS"
 source /opt/ros/humble/setup.bash
 source install/local_setup.bash
 
@@ -72,7 +78,7 @@ Docker image tags should be lowercase, so build the local image as
 Build from the repository root:
 
 ```bash
-cd ~/cs477_ws/src/cs477_IIR
+cd "$CS477_WS/src/cs477_IIR"
 docker build -t image_team_0:latest -f team_0/docker/Dockerfile .
 ```
 
