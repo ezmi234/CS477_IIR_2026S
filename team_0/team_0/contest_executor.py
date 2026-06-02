@@ -23,6 +23,7 @@ from .pose_providers import (
     DetectionPoseProvider,
     GroundTruthPoseProvider,
     HardcodedPoseProvider,
+    VisionPoseProvider,
 )
 from .task_parser import parse_task_command, prioritize_tasks
 
@@ -37,6 +38,10 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.declare_parameter('use_ground_truth_debug', False)
         self.declare_parameter('camera_frame', 'wrist_camera_color_optical_frame')
         self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('vision_pose_topic', '/vision/selected_pose')
+        self.declare_parameter('vision_detection_topic', '/vision/selected_detection')
+        self.declare_parameter('vision_pose_timeout', 1.0)
+        self.declare_parameter('vision_fallback_frame', 'camera_color_optical_frame')
         self.declare_parameter('approach_height', 0.12)
         self.declare_parameter('lift_height', 0.18)
         self.declare_parameter('grasp_z_offset', -0.015)
@@ -123,6 +128,8 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             return GroundTruthPoseProvider(self, self.ground_truth_client)
         if self.pose_provider_name == 'detection':
             return DetectionPoseProvider(self, self.detect_client)
+        if self.pose_provider_name == 'vision':
+            return VisionPoseProvider(self, self.detect_client)
         raise ValueError(f'Unknown pose_provider: {self.pose_provider_name}')
 
     def task_callback(self, msg):

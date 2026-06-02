@@ -80,6 +80,193 @@ python3 -m py_compile src/cs477_IIR/team_0/team_0/*.py
 colcon build --symlink-install --packages-select team_0
 ```
 
+## External Vision Provider Test
+
+Use this when integrating the `feat/vision` branch output from
+`manip_challenge/vision_server.py`.
+
+This mode is for testing a teammate's vision output with the Team 0 execution
+pipeline. Team 0 does not start its own `detection_server` in this mode.
+Instead, it calls the external vision service and consumes the stamped pose
+published by that vision server.
+
+Data flow:
+
+```text
+/task_commands
+-> Team 0 parser / task queue / FSM
+-> VisionPoseProvider
+-> call /detect_objects_with_prompt
+-> read /vision/selected_pose
+-> transform selected pose frame to base_link
+-> Team 0 pick-place pipeline
+```
+
+Important distinction:
+
+```text
+pose_provider:=detection     # Team 0 starts and uses team_0/detection_server.py
+pose_provider:=vision        # Team 0 uses external manip_challenge vision_server.py
+pose_provider:=ground_truth  # Debug only, asks Gazebo /get_object_pose
+pose_provider:=hardcoded     # Debug only, uses fixed poses in config.py
+```
+
+The external vision server returns a `geometry_msgs/Pose` from the service, but
+that response has no `frame_id`. Therefore Team 0 waits for
+`/vision/selected_pose`, which is a `geometry_msgs/PoseStamped`, and transforms
+that pose into `base_link`. This is the main reason `pose_provider:=vision`
+exists separately from `pose_provider:=detection`.
+
+Terminal 1: simulator.
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/local_setup.bash
+ros2 launch manip_challenge ur5_setup_set2_picking.launch.py
+```
+
+Terminal 2: external vision server.
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/local_setup.bash
+
+ros2 launch manip_challenge vision_detection.launch.py \
+  camera_selection_mode:=preferred_only \
+  preferred_camera:=top
+```
+
+Wait until the vision server reports ready camera input. Useful checks:
+
+```bash
+ros2 service list | grep detect_objects_with_prompt
+ros2 topic list | grep /vision
+```
+
+You can test the vision server alone before starting Team 0:
+
+```bash
+ros2 run manip_challenge vision_client "Detect a banana and return pose"
+ros2 topic echo /vision/selected_pose
+ros2 topic echo /vision/selected_detection
+```
+
+Expected vision behavior:
+
+```text
+/detect_objects_with_prompt is available
+/vision/selected_pose publishes a PoseStamped with a non-empty frame_id
+/vision/selected_detection publishes JSON metadata for the selected bbox
+```
+
+Terminal 3: Team 0 executor using the external vision output.
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/local_setup.bash
+
+ros2 launch team_0 contest_run.launch.py \
+  start_detection:=false \
+  pose_provider:=vision
+```
+
+Expected Team 0 startup logs:
+
+```text
+Pose provider: vision
+Standby: waiting for /task_commands
+```
+
+Do not set `start_detection:=true` in this mode unless you intentionally want
+Team 0's own detection server to compete for the same service name. For external
+vision integration, keep:
+
+```text
+start_detection:=false
+pose_provider:=vision
+```
+
+Terminal 4: publish a command.
+
+Single task:
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/local_setup.bash
+
+ros2 topic pub --once /task_commands std_msgs/msg/String \
+  "{data: 'Move the banana to the left storage.'}"
+```
+
+Multi-task:
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/local_setup.bash
+
+ros2 topic pub --once /task_commands std_msgs/msg/String \
+  "{data: 'Move the meat can to the left storage. Move the strawberry to the right storage. Move the coke can to the shelf.'}"
+```
+
+Useful vision debug topics:
+
+```bash
+ros2 topic echo /vision/selected_pose
+ros2 topic echo /vision/selected_detection
+ros2 topic echo /vision/detections
+```
+
+Expected Team 0 logs during a successful vision task:
+
+```text
+Received task command
+Built N task(s)
+Start task: banana -> left_storage
+Vision prompt: Detect a banana and return pose
+Vision selected pose: frame=..., x=..., y=..., z=...
+Target in base_link: x=..., y=..., z=...
+Task complete: banana -> left_storage
+FSM done. Standby: waiting for /task_commands
+```
+
+If Team 0 prints `Skipping unreachable/invalid pick pose`, the vision output was
+received but transformed to a position outside the allowed pick workspace. Check:
+
+```bash
+ros2 topic echo /vision/selected_pose
+ros2 topic echo /vision/selected_detection
+ros2 run tf2_ros tf2_echo base_link <selected_pose_frame_id>
+```
+
+If Team 0 prints `Vision service returned no pose`, the external vision server
+did not find the requested object or its confidence was below threshold. Check
+the vision server logs and `/vision/detections`.
+
+For first integration, prefer `camera_selection_mode:=preferred_only` so every
+detection comes from a predictable camera frame. After TF and grasp offsets are
+validated, `camera_selection_mode:=all` can be tested.
+
+Common parameter variants:
+
+```bash
+# Use all ready cameras after fixed-camera integration is validated.
+ros2 launch manip_challenge vision_detection.launch.py \
+  camera_selection_mode:=all
+
+# Increase Team 0 wait time for /vision/selected_pose metadata.
+ros2 launch team_0 contest_run.launch.py \
+  start_detection:=false \
+  pose_provider:=vision \
+  vision_pose_timeout:=2.0
+
+# Fallback only: frame used if /vision/selected_pose is not received.
+# Prefer fixing /vision/selected_pose instead of relying on this.
+ros2 launch team_0 contest_run.launch.py \
+  start_detection:=false \
+  pose_provider:=vision \
+  vision_fallback_frame:=camera_color_optical_frame
+```
+
 ## Three-Terminal Ground-Truth Motion Test
 
 Terminal 1: simulator.

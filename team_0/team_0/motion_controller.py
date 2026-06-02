@@ -82,7 +82,9 @@ class MotionMixin:
         stamped.header.frame_id = source_frame
         stamped.pose = pose
         stamped.pose.orientation.w = 1.0
+        return self.transform_pose_stamped(stamped, target_frame)
 
+    def transform_pose_stamped(self, stamped, target_frame):
         try:
             transformed = self.tf_buffer.transform(
                 stamped,
