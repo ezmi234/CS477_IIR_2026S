@@ -119,7 +119,8 @@ No API key file is required or read by the official launch files.
   queue, and FSM.
 - `team_0/task_parser.py`: `/task_commands` parser.
 - `team_0/pose_providers.py`: detection pose provider and local debug pose
-  providers.
+  providers. It also includes an adapter for an external vision server that
+  publishes `/vision/selected_pose`.
 - `team_0/pick_place_controller.py`: grasp offsets, pick sequence, storage
   placement, and shelf placement.
 - `team_0/motion_controller.py`: joint state handling, TF transform, IK/FK, and

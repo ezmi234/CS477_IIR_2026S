@@ -1,6 +1,7 @@
 import rclpy
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, PoseStamped
 from riro_srvs.srv import StringPose
+from std_msgs.msg import String
 
 from .config import HARDCODED_PICK_TARGETS
 
@@ -102,5 +103,96 @@ class DetectionPoseProvider(PoseProvider):
         return self.node.transform_pose(
             pose_camera,
             self.node.get_parameter('camera_frame').value,
+            self.node.get_parameter('base_frame').value,
+        )
+
+
+class VisionPoseProvider(PoseProvider):
+    """Adapter for ezmi234 feat/vision output.
+
+    The vision server exposes the same StringPose service as Team 0 detection,
+    but the response Pose has no frame_id. It also publishes
+    /vision/selected_pose as PoseStamped. This provider uses the stamped pose
+    whenever available and transforms it to the executor base frame.
+    """
+
+    def __init__(self, node, client):
+        super().__init__(node)
+        self.client = client
+        self.latest_pose_stamped = None
+        self.latest_detection_json = ''
+        pose_topic = self.node.get_parameter('vision_pose_topic').value
+        detection_topic = self.node.get_parameter('vision_detection_topic').value
+        self.node.create_subscription(PoseStamped, pose_topic, self.pose_callback, 10)
+        self.node.create_subscription(String, detection_topic, self.detection_callback, 10)
+
+    def pose_callback(self, msg):
+        self.latest_pose_stamped = msg
+
+    def detection_callback(self, msg):
+        self.latest_detection_json = msg.data
+
+    def wait_until_ready(self):
+        while rclpy.ok() and not self.client.wait_for_service(timeout_sec=1.0):
+            self.node.get_logger().info('Waiting for external vision service...')
+            rclpy.spin_once(self.node, timeout_sec=0.1)
+
+    def get_object_pose(self, object_name):
+        prompt_name = object_name.replace('_', ' ')
+        request = StringPose.Request()
+        request.data = f'Detect a {prompt_name} and return pose'
+        self.latest_pose_stamped = None
+        self.latest_detection_json = ''
+        self.node.get_logger().info(f'Vision prompt: {request.data}')
+
+        future = self.client.call_async(request)
+        rclpy.spin_until_future_complete(self.node, future, timeout_sec=20.0)
+        if not future.done() or future.result() is None:
+            return None
+
+        response_pose = future.result().pose
+        if (
+            abs(response_pose.position.x) < 1e-9
+            and abs(response_pose.position.y) < 1e-9
+            and abs(response_pose.position.z) < 1e-9
+            and abs(response_pose.orientation.w) < 1e-9
+        ):
+            self.node.get_logger().error(f'Vision service returned no pose for {object_name}.')
+            return None
+
+        timeout_sec = float(self.node.get_parameter('vision_pose_timeout').value)
+        start_time = self.node.get_clock().now().nanoseconds * 1e-9
+        while rclpy.ok() and self.latest_pose_stamped is None:
+            now = self.node.get_clock().now().nanoseconds * 1e-9
+            if now - start_time > timeout_sec:
+                break
+            rclpy.spin_once(self.node, timeout_sec=0.05)
+
+        if self.latest_pose_stamped is not None and self.latest_pose_stamped.header.frame_id:
+            pose_stamped = self.latest_pose_stamped
+            self.node.get_logger().info(
+                'Vision selected pose: '
+                f'frame={pose_stamped.header.frame_id}, '
+                f'x={pose_stamped.pose.position.x:.3f}, '
+                f'y={pose_stamped.pose.position.y:.3f}, '
+                f'z={pose_stamped.pose.position.z:.3f}'
+            )
+            if self.latest_detection_json:
+                self.node.get_logger().info(
+                    f'Vision selected detection: {self.latest_detection_json[:500]}'
+                )
+            return self.node.transform_pose_stamped(
+                pose_stamped,
+                self.node.get_parameter('base_frame').value,
+            )
+
+        fallback_frame = self.node.get_parameter('vision_fallback_frame').value
+        self.node.get_logger().warn(
+            'Vision selected PoseStamped was not received; '
+            f'falling back to response.pose in frame {fallback_frame!r}.'
+        )
+        return self.node.transform_pose(
+            response_pose,
+            fallback_frame,
             self.node.get_parameter('base_frame').value,
         )

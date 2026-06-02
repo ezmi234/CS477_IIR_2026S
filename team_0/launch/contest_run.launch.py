@@ -18,9 +18,14 @@ def generate_launch_description():
     auto_start_command = LaunchConfiguration('auto_start_command')
     pose_provider = LaunchConfiguration('pose_provider')
     use_ground_truth_debug = LaunchConfiguration('use_ground_truth_debug')
+    detection_service = LaunchConfiguration('detection_service')
     detector_backend = LaunchConfiguration('detector_backend')
     detector_model_path = LaunchConfiguration('detector_model_path')
     camera_frame = LaunchConfiguration('camera_frame')
+    vision_pose_topic = LaunchConfiguration('vision_pose_topic')
+    vision_detection_topic = LaunchConfiguration('vision_detection_topic')
+    vision_pose_timeout = LaunchConfiguration('vision_pose_timeout')
+    vision_fallback_frame = LaunchConfiguration('vision_fallback_frame')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -41,7 +46,12 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'pose_provider',
             default_value='',
-            description='Pose source: detection, ground_truth, or hardcoded. Empty defaults to detection.',
+            description='Pose source: detection, vision, ground_truth, or hardcoded. Empty defaults to detection.',
+        ),
+        DeclareLaunchArgument(
+            'detection_service',
+            default_value='detect_objects_with_prompt',
+            description='StringPose service used by detection/vision pose providers.',
         ),
         DeclareLaunchArgument(
             'detector_backend',
@@ -58,6 +68,26 @@ def generate_launch_description():
             default_value='wrist_camera_color_optical_frame',
             description='Camera TF frame used for RGB-D localization.',
         ),
+        DeclareLaunchArgument(
+            'vision_pose_topic',
+            default_value='/vision/selected_pose',
+            description='PoseStamped output topic from external vision server.',
+        ),
+        DeclareLaunchArgument(
+            'vision_detection_topic',
+            default_value='/vision/selected_detection',
+            description='JSON metadata output topic from external vision server.',
+        ),
+        DeclareLaunchArgument(
+            'vision_pose_timeout',
+            default_value='1.0',
+            description='Seconds to wait for /vision/selected_pose after service response.',
+        ),
+        DeclareLaunchArgument(
+            'vision_fallback_frame',
+            default_value='camera_color_optical_frame',
+            description='Frame for vision response.pose if selected PoseStamped is unavailable.',
+        ),
         Node(
             package='team_0',
             executable='detection_server',
@@ -67,7 +97,7 @@ def generate_launch_description():
             parameters=[{
                 'backend': detector_backend,
                 'model_path': detector_model_path,
-                'service_name': 'detect_objects_with_prompt',
+                'service_name': detection_service,
                 'camera_frame': camera_frame,
             }],
         ),
@@ -80,7 +110,12 @@ def generate_launch_description():
                 'auto_start_command': auto_start_command,
                 'pose_provider': pose_provider,
                 'use_ground_truth_debug': use_ground_truth_debug,
+                'detection_service': detection_service,
                 'camera_frame': camera_frame,
+                'vision_pose_topic': vision_pose_topic,
+                'vision_detection_topic': vision_detection_topic,
+                'vision_pose_timeout': vision_pose_timeout,
+                'vision_fallback_frame': vision_fallback_frame,
             }],
         ),
     ])

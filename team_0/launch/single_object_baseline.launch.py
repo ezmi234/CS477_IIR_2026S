@@ -17,9 +17,15 @@ def launch_setup(context, *_args, **_kwargs):
     object_name = LaunchConfiguration('object_name').perform(context)
     destination = LaunchConfiguration('destination').perform(context)
     start_detection = LaunchConfiguration('start_detection')
+    pose_provider = LaunchConfiguration('pose_provider')
+    detection_service = LaunchConfiguration('detection_service')
     detector_backend = LaunchConfiguration('detector_backend')
     detector_model_path = LaunchConfiguration('detector_model_path')
     camera_frame = LaunchConfiguration('camera_frame')
+    vision_pose_topic = LaunchConfiguration('vision_pose_topic')
+    vision_detection_topic = LaunchConfiguration('vision_detection_topic')
+    vision_pose_timeout = LaunchConfiguration('vision_pose_timeout')
+    vision_fallback_frame = LaunchConfiguration('vision_fallback_frame')
     command = f"Move the {object_name.replace('_', ' ')} to the {destination.replace('_', ' ')}."
 
     return [
@@ -32,7 +38,7 @@ def launch_setup(context, *_args, **_kwargs):
             parameters=[{
                 'backend': detector_backend,
                 'model_path': detector_model_path,
-                'service_name': 'detect_objects_with_prompt',
+                'service_name': detection_service,
                 'camera_frame': camera_frame,
             }],
         ),
@@ -43,9 +49,14 @@ def launch_setup(context, *_args, **_kwargs):
             output='screen',
             parameters=[{
                 'auto_start_command': command,
-                'pose_provider': 'detection',
+                'pose_provider': pose_provider,
                 'use_ground_truth_debug': False,
+                'detection_service': detection_service,
                 'camera_frame': camera_frame,
+                'vision_pose_topic': vision_pose_topic,
+                'vision_detection_topic': vision_detection_topic,
+                'vision_pose_timeout': vision_pose_timeout,
+                'vision_fallback_frame': vision_fallback_frame,
             }],
         ),
     ]
@@ -69,6 +80,16 @@ def generate_launch_description():
             description='Start the Team 0 RGB-D detection service.',
         ),
         DeclareLaunchArgument(
+            'pose_provider',
+            default_value='detection',
+            description='Pose source: detection or vision.',
+        ),
+        DeclareLaunchArgument(
+            'detection_service',
+            default_value='detect_objects_with_prompt',
+            description='StringPose service used by detection/vision pose providers.',
+        ),
+        DeclareLaunchArgument(
             'detector_backend',
             default_value='yolo',
             description='Detection backend: yolo, auto, or gemini.',
@@ -82,6 +103,26 @@ def generate_launch_description():
             'camera_frame',
             default_value='wrist_camera_color_optical_frame',
             description='Camera TF frame used for RGB-D localization.',
+        ),
+        DeclareLaunchArgument(
+            'vision_pose_topic',
+            default_value='/vision/selected_pose',
+            description='PoseStamped output topic from external vision server.',
+        ),
+        DeclareLaunchArgument(
+            'vision_detection_topic',
+            default_value='/vision/selected_detection',
+            description='JSON metadata output topic from external vision server.',
+        ),
+        DeclareLaunchArgument(
+            'vision_pose_timeout',
+            default_value='1.0',
+            description='Seconds to wait for /vision/selected_pose after service response.',
+        ),
+        DeclareLaunchArgument(
+            'vision_fallback_frame',
+            default_value='camera_color_optical_frame',
+            description='Frame for vision response.pose if selected PoseStamped is unavailable.',
         ),
         OpaqueFunction(function=launch_setup),
     ])
