@@ -36,7 +36,11 @@ except Exception:
 from riro_srvs.srv import StringPose
 
 from .backends import make_backend
-from .grasp_estimator import DEFAULT_GRASP_CONFIG, estimate_grasp_candidate
+from .grasp_estimator import (
+    DEFAULT_GRASP_CONFIG,
+    estimate_grasp_candidates,
+    fallback_grasp_candidates,
+)
 from .labels import canonical_aliases_for_log, extract_target_label, normalize_label
 from .types import CameraState, Detection
 from .visualization import draw_detections
@@ -84,6 +88,18 @@ def _quat_rotate_vector(q, v):
     return (rx, ry, rz)
 
 
+def _pose_stamped_to_dict(stamped: PoseStamped | None) -> dict[str, Any] | None:
+    if stamped is None:
+        return None
+    p = stamped.pose.position
+    q = stamped.pose.orientation
+    return {
+        "frame_id": stamped.header.frame_id,
+        "position": [float(p.x), float(p.y), float(p.z)],
+        "orientation": [float(q.x), float(q.y), float(q.z), float(q.w)],
+    }
+
+
 class VisionServer(Node):
     def __init__(self):
         super().__init__("vision_server")
@@ -101,6 +117,7 @@ class VisionServer(Node):
         self.declare_parameter("vision_backend", "")
         self.declare_parameter("future_backend_order", ["yolo", "hf_owlvit"])
         self.declare_parameter("yolo_model_path", "")
+        self.declare_parameter("yolo_conf", 0.15)
         self.declare_parameter("grasp_config_file", "grasp.yaml")
         self.declare_parameter("min_return_score", 0.03)
         self.declare_parameter("device", "cpu")
@@ -148,6 +165,7 @@ class VisionServer(Node):
             "hf_score_threshold": float(self.get_parameter("hf_score_threshold").value),
             "depth_min_area": int(self.get_parameter("depth_min_area").value),
             "yolo_model_path": str(self.get_parameter("yolo_model_path").value),
+            "yolo_conf": float(self.get_parameter("yolo_conf").value),
         }
         backend_value = self.get_parameter("backend_order").value
         if isinstance(backend_value, str):
@@ -173,6 +191,7 @@ class VisionServer(Node):
         self.selected_grasp_pub = self.create_publisher(PoseStamped, "/vision/selected_grasp", 10)
         self.selected_grasp_base_pub = self.create_publisher(PoseStamped, "/vision/selected_grasp_base", 10)
         self.grasp_candidates_pub = self.create_publisher(String, "/vision/grasp_candidates", 10)
+        self.grasp_debug_pub = self.create_publisher(String, "/vision/grasp_debug", 10)
         self.debug_image_pub = self.create_publisher(Image, "/vision/debug_image", 10)
 
         self.status_timer = self.create_timer(2.0, self.log_camera_status)
@@ -335,6 +354,7 @@ class VisionServer(Node):
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.pose = p
         self.pose_pub.publish(pose_msg)
+        selected_pose_base = self.safe_transform_pose_stamped(pose_msg, self.base_frame)
         selected_json = json.dumps(selected.to_dict())
         self.selected_detection_pub.publish(String(data=selected_json))
 
@@ -342,26 +362,87 @@ class VisionServer(Node):
 
         selected_grasp = None
         selected_grasp_base = None
+        grasp_candidates = []
         grasp_json = ""
         if selected_cam is not None and selected_cam.cloud_msg is not None:
-            selected_grasp = estimate_grasp_candidate(
+            grasp_candidates = estimate_grasp_candidates(
                 selected_cam.image_bgr,
                 selected_cam.cloud_msg,
                 selected.to_dict(),
                 self.grasp_config,
             )
-            if selected_grasp is not None:
+            min_candidate_score = float(
+                self.grasp_config.get("default", {}).get("min_candidate_score", 0.25)
+            )
+            if not grasp_candidates or grasp_candidates[0].score < min_candidate_score:
+                template_candidates = fallback_grasp_candidates(
+                    selected.to_dict(),
+                    self.grasp_config,
+                    frame_id=selected_cam.cloud_msg.header.frame_id,
+                    camera_name=selected_cam.name,
+                )
+                if template_candidates:
+                    grasp_candidates.extend(template_candidates)
+                    grasp_candidates.sort(key=lambda c: c.score, reverse=True)
+
+            if grasp_candidates:
+                selected_grasp = grasp_candidates[0]
                 selected_grasp.pose.header.stamp = self.get_clock().now().to_msg()
                 self.selected_grasp_pub.publish(selected_grasp.pose)
                 selected_grasp_base = self.safe_transform_pose_stamped(selected_grasp.pose, self.base_frame)
+                candidate_dicts = [candidate.to_dict() for candidate in grasp_candidates]
                 candidate_dict = selected_grasp.to_dict()
                 if selected_grasp_base is not None:
                     self.selected_grasp_base_pub.publish(selected_grasp_base)
                     bp = selected_grasp_base.pose.position
                     candidate_dict["base_frame"] = self.base_frame
                     candidate_dict["grasp_xyz_base"] = [float(bp.x), float(bp.y), float(bp.z)]
-                grasp_json = json.dumps(candidate_dict)
+                    candidate_dict["pose_base"] = _pose_stamped_to_dict(selected_grasp_base)
+                    candidate_dicts[0]["base_frame"] = self.base_frame
+                    candidate_dicts[0]["grasp_xyz_base"] = [float(bp.x), float(bp.y), float(bp.z)]
+                    candidate_dicts[0]["pose_base"] = _pose_stamped_to_dict(selected_grasp_base)
+                grasp_payload = dict(candidate_dict)
+                grasp_payload["selected"] = candidate_dict
+                grasp_payload["candidates"] = candidate_dicts
+                grasp_payload["used_fallback"] = bool(
+                    candidate_dict.get("debug", {}).get("fallback", False)
+                )
+                grasp_payload["transform_success"] = selected_grasp_base is not None
+                grasp_payload["object_center_camera"] = _pose_stamped_to_dict(pose_msg)
+                grasp_payload["object_center_base"] = _pose_stamped_to_dict(selected_pose_base)
+                grasp_json = json.dumps(grasp_payload)
                 self.grasp_candidates_pub.publish(String(data=grasp_json))
+                self.grasp_debug_pub.publish(String(data=json.dumps({
+                    "object_label": selected.label,
+                    "detection_score": float(selected.effective_score()),
+                    "camera_name": selected.camera_name,
+                    "source_frame": selected.frame_id,
+                    "bbox_xyxy": list(selected.bbox_xyxy),
+                    "object_center_camera": _pose_stamped_to_dict(pose_msg),
+                    "object_center_base_link": _pose_stamped_to_dict(selected_pose_base),
+                    "roi_point_count_before_filtering": candidate_dict.get("debug", {}).get(
+                        "roi_point_count_before_filtering"
+                    ),
+                    "roi_point_count_after_filtering": candidate_dict.get("debug", {}).get(
+                        "roi_point_count_after_filtering"
+                    ),
+                    "estimated_dimensions": candidate_dict.get("debug", {}).get("estimated_dimensions"),
+                    "principal_axis": candidate_dict.get("debug", {}).get("principal_axis"),
+                    "candidate_grasp_poses": [
+                        cand.get("pose_camera") for cand in candidate_dicts
+                    ],
+                    "candidate_yaw_values": [
+                        cand.get("yaw") for cand in candidate_dicts
+                    ],
+                    "selected_grasp_score": float(selected_grasp.score),
+                    "selected_grasp_camera_frame": candidate_dict.get("pose_camera"),
+                    "selected_grasp_base_link": _pose_stamped_to_dict(selected_grasp_base),
+                    "pre_grasp_pose": None,
+                    "final_grasp_pose": _pose_stamped_to_dict(selected_grasp_base),
+                    "gripper_width_estimate": float(selected_grasp.width),
+                    "motion_success": None,
+                    "all_candidates": candidate_dicts,
+                })))
                 self.get_logger().info(
                     "Vision selected grasp pose: "
                     f"frame={selected_grasp.pose.header.frame_id}, "
@@ -385,6 +466,17 @@ class VisionServer(Node):
                     "source_frame": selected.frame_id,
                     "bbox_xyxy": list(selected.bbox_xyxy),
                     "error": "grasp_estimator_returned_none",
+                })))
+                self.grasp_debug_pub.publish(String(data=json.dumps({
+                    "object_label": selected.label,
+                    "detection_score": float(selected.effective_score()),
+                    "camera_name": selected.camera_name,
+                    "source_frame": selected.frame_id,
+                    "bbox_xyxy": list(selected.bbox_xyxy),
+                    "object_center_camera": _pose_stamped_to_dict(pose_msg),
+                    "object_center_base_link": _pose_stamped_to_dict(selected_pose_base),
+                    "error": "grasp_estimator_returned_none",
+                    "motion_success": None,
                 })))
                 self.get_logger().warn(
                     f"No grasp candidate produced for label={selected.label} camera={selected.camera_name}."

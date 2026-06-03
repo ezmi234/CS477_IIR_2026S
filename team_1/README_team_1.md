@@ -52,6 +52,8 @@ Use `--once` during local tests to avoid repeated queued commands:
 
 ```bash
 ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'Move the banana and the meat can to the left storage. Move the strawberry and the hammer to the right storage. Move the coke can on the shelf.'}"
+
+ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'Move the banana to the left storage.'}"
 ```
 
 ## Vision

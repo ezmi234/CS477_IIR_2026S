@@ -123,6 +123,27 @@ PICK_POSITION_OFFSETS = {
     'hammer': (-0.04, 0.06, 0.0),
 }
 
+OBJECT_PICK_OVERRIDES = {
+    'banana': {
+        'approach_height': 0.16,
+        'lift_height': 0.28,
+        'grasp_z_offset': -0.010,
+        'approach_duration': 2.0,
+        'descent_duration': 1.6,
+        'lift_duration': 2.0,
+        'post_close_sleep': 0.35,
+    },
+    'hammer': {
+        'approach_height': 0.17,
+        'lift_height': 0.32,
+        'grasp_z_offset': -0.010,
+        'approach_duration': 2.1,
+        'descent_duration': 1.7,
+        'lift_duration': 2.2,
+        'post_close_sleep': 0.35,
+    },
+}
+
 STORAGE_OBJECT_OVERRIDES = {
     'banana': {
         'approach_duration': 2.0,
@@ -209,4 +230,16 @@ def _apply_target_config():
             _deep_update(PLACE_CONFIGS[name], values)
 
 
+def _apply_motion_config():
+    motion = _load_package_yaml('motion.yaml')
+    object_pick = motion.get('object_pick', {})
+    if isinstance(object_pick, dict):
+        for name, values in object_pick.items():
+            if isinstance(values, dict):
+                current = dict(OBJECT_PICK_OVERRIDES.get(name, {}))
+                _deep_update(current, values)
+                OBJECT_PICK_OVERRIDES[name] = current
+
+
 _apply_target_config()
+_apply_motion_config()

@@ -1,4 +1,5 @@
 import json
+import math
 import time
 
 import rclpy
@@ -12,6 +13,7 @@ from .config import HARDCODED_PICK_TARGETS
 class PoseProvider:
     def __init__(self, node):
         self.node = node
+        self.latest_pose_is_grasp = False
 
     def wait_until_ready(self):
         return
@@ -22,6 +24,7 @@ class PoseProvider:
 
 class HardcodedPoseProvider(PoseProvider):
     def get_object_pose(self, object_name):
+        self.latest_pose_is_grasp = False
         target = HARDCODED_PICK_TARGETS.get(object_name)
         if target is None:
             self.node.get_logger().error(f'No hardcoded pick target for {object_name}.')
@@ -43,9 +46,19 @@ class HardcodedPoseProvider(PoseProvider):
 
 
 class GroundTruthPoseProvider(PoseProvider):
-    def __init__(self, node, client):
+    def __init__(self, node, client, vision_client=None):
         super().__init__(node)
         self.client = client
+        self.vision_client = vision_client
+        self.latest_grasp_base = None
+        self.latest_grasp_json = ''
+        try:
+            grasp_base_topic = self.node.get_parameter('vision_grasp_base_topic').value
+            grasp_candidates_topic = self.node.get_parameter('vision_grasp_candidates_topic').value
+            self.node.create_subscription(PoseStamped, grasp_base_topic, self.grasp_base_callback, 10)
+            self.node.create_subscription(String, grasp_candidates_topic, self.grasp_candidates_callback, 10)
+        except Exception:
+            pass
 
     def wait_until_ready(self):
         deadline = time.monotonic() + float(self.node.get_parameter('startup_wait_timeout').value)
@@ -63,6 +76,7 @@ class GroundTruthPoseProvider(PoseProvider):
             )
 
     def get_object_pose(self, object_name):
+        self.latest_pose_is_grasp = False
         self.node.get_logger().warn(
             'Using /get_object_pose debug fallback. Do not use this mode in competition.'
         )
@@ -70,17 +84,93 @@ class GroundTruthPoseProvider(PoseProvider):
         request.data = object_name
         future = self.client.call_async(request)
         rclpy.spin_until_future_complete(self.node, future, timeout_sec=5.0)
+        pose = None
+        if future.done() and future.result() is not None:
+            pose = future.result().pose
+            pose.position.z += self.node.ground_truth_z_offset(object_name)
+            pose.orientation.w = 1.0
+            self.node.get_logger().info(
+                'Ground-truth target: '
+                f'x={pose.position.x:.3f}, y={pose.position.y:.3f}, z={pose.position.z:.3f}'
+            )
+
+        vision_grasp = self.try_vision_grasp(object_name)
+        if vision_grasp is not None:
+            self.latest_pose_is_grasp = True
+            return vision_grasp
+
+        if pose is None:
+            return None
+        self.latest_pose_is_grasp = True
+        return self.template_grasp_from_ground_truth(object_name, pose)
+
+    def grasp_base_callback(self, msg):
+        self.latest_grasp_base = msg
+
+    def grasp_candidates_callback(self, msg):
+        self.latest_grasp_json = msg.data
+
+    def try_vision_grasp(self, object_name):
+        if self.vision_client is None or not self.vision_client.service_is_ready():
+            return None
+        prompt_name = object_name.replace('_', ' ')
+        request = StringPose.Request()
+        request.data = f'Detect a {prompt_name} and return pose'
+        self.latest_grasp_base = None
+        self.latest_grasp_json = ''
+        self.node.get_logger().info(
+            f'Ground-truth debug still probing RGB-D grasp estimator: {request.data}'
+        )
+        future = self.vision_client.call_async(request)
+        rclpy.spin_until_future_complete(self.node, future, timeout_sec=20.0)
         if not future.done() or future.result() is None:
             return None
 
-        pose = future.result().pose
-        pose.position.z += self.node.ground_truth_z_offset(object_name)
-        pose.orientation.w = 1.0
+        timeout_sec = float(self.node.get_parameter('vision_pose_timeout').value)
+        start_time = time.monotonic()
+        while rclpy.ok() and self.latest_grasp_base is None:
+            if time.monotonic() - start_time > timeout_sec:
+                break
+            rclpy.spin_once(self.node, timeout_sec=0.05)
+        if self.latest_grasp_base is None or not self.latest_grasp_base.header.frame_id:
+            self.node.get_logger().warn(
+                'RGB-D grasp estimator did not publish a base grasp in ground-truth debug mode.'
+            )
+            return None
+        pose_stamped = self.latest_grasp_base
         self.node.get_logger().info(
-            'Ground-truth target: '
-            f'x={pose.position.x:.3f}, y={pose.position.y:.3f}, z={pose.position.z:.3f}'
+            'Ground-truth debug using RGB-D grasp estimate: '
+            f'frame={pose_stamped.header.frame_id}, '
+            f'x={pose_stamped.pose.position.x:.3f}, '
+            f'y={pose_stamped.pose.position.y:.3f}, '
+            f'z={pose_stamped.pose.position.z:.3f}'
         )
-        return pose
+        if pose_stamped.header.frame_id == self.node.get_parameter('base_frame').value:
+            return pose_stamped.pose
+        return self.node.transform_pose_stamped(
+            pose_stamped,
+            self.node.get_parameter('base_frame').value,
+        )
+
+    @staticmethod
+    def template_grasp_from_ground_truth(object_name, pose):
+        out = Pose()
+        out.position.x = float(pose.position.x)
+        out.position.y = float(pose.position.y)
+        out.position.z = float(pose.position.z)
+        yaw = 0.0
+        if object_name == 'banana':
+            out.position.z += 0.03
+            yaw = 0.0
+        elif object_name == 'hammer':
+            out.position.x -= 0.04
+            out.position.z += 0.02
+            yaw = 0.0
+        elif object_name in ('coke_can', 'meat_can', 'strawberry'):
+            out.position.z += 0.02
+        out.orientation.z = math.sin(yaw * 0.5)
+        out.orientation.w = math.cos(yaw * 0.5)
+        return out
 
 
 class DetectionPoseProvider(PoseProvider):
@@ -104,6 +194,7 @@ class DetectionPoseProvider(PoseProvider):
             )
 
     def get_object_pose(self, object_name):
+        self.latest_pose_is_grasp = False
         prompt_name = object_name.replace('_', ' ')
         request = StringPose.Request()
         request.data = f'Detect a {prompt_name} and return [ymin, xmin, ymax, xmax, label]'
@@ -183,6 +274,7 @@ class VisionPoseProvider(PoseProvider):
             )
 
     def get_object_pose(self, object_name):
+        self.latest_pose_is_grasp = False
         prompt_name = object_name.replace('_', ' ')
         response_pose = None
         max_attempts = 3
@@ -259,12 +351,14 @@ class VisionPoseProvider(PoseProvider):
                 f'{score_text}'
             )
             if pose_stamped.header.frame_id == self.node.get_parameter('base_frame').value:
+                self.latest_pose_is_grasp = True
                 return pose_stamped.pose
             transformed = self.node.transform_pose_stamped(
                 pose_stamped,
                 self.node.get_parameter('base_frame').value,
             )
             if transformed is not None:
+                self.latest_pose_is_grasp = True
                 return transformed
             self.node.get_logger().warn(
                 'Vision grasp pose was available but could not be transformed; '

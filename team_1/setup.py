@@ -28,6 +28,7 @@ setup(
             'vision_server = team_1.vision.vision_server:main',
             'vision_client = team_1.vision.vision_client:main',
             'vision_snapshot_collector = team_1.vision.snapshot_collector:main',
+            'grasp_diagnostics = team_1.tools.run_grasp_diagnostics:main',
         ],
     },
 )

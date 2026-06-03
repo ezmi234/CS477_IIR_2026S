@@ -22,6 +22,7 @@
     backend_order: ["hf_owlvit"]
     future_backend_order: ["yolo", "hf_owlvit"]
     yolo_model_path: ""
+    yolo_conf: 0.15
     grasp_config_file: "grasp.yaml"
     base_frame: "base_link"
 
@@ -43,17 +44,42 @@
 
     grasp:
       default:
+        strategy: center_top
         approach_height: 0.12
-        grasp_z_offset: 0.015
+        surface_depth_offset: 0.0
         min_points: 80
         max_gripper_width: 0.085
+        min_candidate_score: 0.12
       banana:
-        prefer_pca_axis: true
-        yaw_offset: 1.5708
+        strategy: elongated_pca
+        prefer_center: true
+        candidate_offsets_along_axis: [-0.02, 0.0, 0.02]
+        candidate_yaw_offsets: [0.0, 1.5708]
+        max_expected_width: 0.06
+        min_expected_length: 0.08
+        approach_height: 0.13
+        surface_depth_offset: 0.0
       hammer:
-        prefer_pca_axis: true
+        strategy: handle_grasp
+        candidate_offsets_along_axis: [-0.06, -0.03, 0.0, 0.03, 0.06]
+        prefer_thin_segment: true
+        avoid_bulky_head: true
+        use_largest_cluster: false
+        candidate_yaw_offsets: [0.0, 1.5708]
+        max_handle_width: 0.045
+        approach_height: 0.14
+        surface_depth_offset: 0.0
       coke_can:
+        strategy: center_top
         prefer_center_top: true
+        candidate_yaw_offsets: [0.0]
         aliases: ["cola can", "red soda can"]
       meat_can:
+        strategy: center_top
         prefer_center_top: true
+        candidate_yaw_offsets: [0.0]
+      strawberry:
+        strategy: center_top
+        prefer_center_top: true
+        candidate_yaw_offsets: [0.0]
+        approach_height: 0.10
