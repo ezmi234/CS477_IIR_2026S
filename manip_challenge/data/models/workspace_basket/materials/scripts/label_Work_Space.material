@@ -1,0 +1,13 @@
+material Label/Work_Space
+{
+  technique
+  {
+    pass
+    {
+      texture_unit
+      {
+        texture label_Work_Space.png
+      }
+    }
+  }
+}

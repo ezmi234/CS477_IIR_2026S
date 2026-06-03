@@ -1,0 +1,8 @@
+py_trees
+pyassimp
+empy==3.3.4
+lark
+numpy~=1.24.4
+billiard
+FuzzyTM
+catkin_pkg

@@ -1,0 +1,96 @@
+<?xml version="1.0" ?>
+<sdf version="1.7">
+  <model name="bookshelf">
+    <static>true</static>
+    <link name="link">
+      
+      <visual name="base_visual">
+        <pose>0 0 0.01 0 0 0</pose> <geometry>
+          <box>
+            <size>0.3 0.27 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 1 1 1</ambient>
+          <diffuse>1 1 1 1</diffuse>
+        </material>
+      </visual>
+      <collision name="base_collision">
+        <pose>0 0 0.01 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.3 0.27 0.02</size>
+          </box>
+        </geometry>
+      </collision>
+
+      <visual name="middle_visual">
+        <pose>0 0 0.23 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.3 0.27 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 1 1 1</ambient>
+          <diffuse>1 1 1 1</diffuse>
+        </material>
+      </visual>
+      <collision name="middle_collision">
+        <pose>0 0 0.23 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.3 0.27 0.02</size>
+          </box>
+        </geometry>
+      </collision>
+
+
+<visual name="top_visual">
+        <pose>0 0 0.45 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.3 0.27 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <script>
+            <uri>model://bookshelf/materials/scripts</uri>
+            <uri>model://bookshelf/materials/textures</uri>
+            <name>Bookshelf/Label</name>
+          </script>
+        </material>
+      </visual>
+      <collision name="top_collision">
+        <pose>0 0 0.45 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.3 0.27 0.02</size>
+          </box>
+        </geometry>
+      </collision>
+      
+      <visual name="back_visual">
+        <pose>0 0.125 0.23 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.3 0.02 0.46</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 1 1 1</ambient>
+          <diffuse>1 1 1 1</diffuse>
+        </material>
+      </visual>
+      <collision name="back_collision">
+        <pose>0 0.125 0.23 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.3 0.02 0.46</size>
+          </box>
+        </geometry>
+      </collision>
+
+    </link>
+  </model>
+</sdf>

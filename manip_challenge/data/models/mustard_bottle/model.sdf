@@ -1,0 +1,38 @@
+<?xml version="1.0" ?>
+<sdf version="1.7">
+<!--
+This SDF file was automatically generated using a template modified 
+and authored by Adwait Naik. The moment of interia is not supposed to be changed.
+-->
+    <model name="mustard_bottle">
+      <pose>0 0 0 0 0 0</pose> 
+      <link name="link">
+        <inertial>
+          <inertia>
+           <ixx>1.6697164243557222e-1</ixx>
+           <ixy>-7.608043365683558e-1</ixy>
+           <ixz>-8.85497422500391e-1</ixz>
+           <iyy>1.454996005383364e-1</iyy>
+           <iyz>5.1836699346339805e-1</iyz>
+           <izz>4.2928863786736384e-1</izz>
+          </inertia>
+          <mass>0.6120391571167176</mass>
+        </inertial>
+        <collision name="collision">
+          <geometry>
+          	<mesh>
+             <uri>model://mustard_bottle/textured.dae</uri>
+            </mesh>
+          </geometry>
+        </collision>
+
+        <visual name="visual">
+          <geometry>
+          	<mesh>
+            <uri>model://mustard_bottle/textured.dae</uri>
+	        </mesh>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+</sdf>

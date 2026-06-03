@@ -1,0 +1,132 @@
+<?xml version="1.0" ?>
+
+<sdf version="1.5">
+
+  <world name="default">
+
+    <!-- <physics type="ode"> -->
+    <!--   <!-\- <max_step_size>0.001</max_step_size> -\-> -->
+    <!--   <!-\- <real_time_update_rate>1000</real_time_update_rate> -\-> -->
+    <!--   <ode> -->
+    <!--     <!-\- <min_depth>0.002</min_depth> -\-> -->
+    <!--     <!-\-   <solver> -\-> -->
+    <!--     <!-\-     <type>quick</type> -\-> -->
+    <!--     <!-\-     <iters>100</iters> -\-> -->
+    <!--     <!-\-   </solver> -\-> -->
+    <!--     <constraints> -->
+    <!--       <contact_max_correcting_vel>0.0001</contact_max_correcting_vel> -->
+          
+    <!--       <!-\- <contact_surface_layer>0.001</contact_surface_layer> -\-> -->
+    <!--       <!-\- <cfm>0.00001</cfm> -\-> -->
+    <!--       <!-\- <erp>0.2</erp> -\-> -->
+    <!--     </constraints> -->
+    <!--   </ode> -->
+    <!-- </physics>     -->
+    <scene>
+      <shadows>0</shadows>
+    </scene>
+    
+    <gui fullscreen='0'>
+      <camera name='user_camera'>
+        <pose>-1.15 1.58 2.56 0.0 0.77 -0.82</pose>
+        <view_controller>orbit</view_controller>
+        <projection_type>perspective</projection_type>
+      </camera>
+    </gui>
+    
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <scene>
+      <shadows>0</shadows>
+    </scene>
+
+    <model name="ur5_base">
+      <include>
+        <uri>model://ur5_base</uri>
+      </include>
+      <pose>0 0 0 0 0 0</pose>
+    </model>
+
+    <model name="cafe_table_left">
+      <include>
+        <uri>model://ur5_base</uri>
+      </include>
+      <pose>0 0.55 0 0 0 0</pose>
+    </model>
+    
+    <model name="cafe_table_right">
+      <include>
+        <uri>model://ur5_base</uri>
+      </include>
+      <pose>0 -0.55 0 0 0 0</pose>
+    </model>
+    
+    <model name="cafe_table">
+      <static>true</static>
+      <include>
+        <uri>model://cafe_table</uri>
+      </include>
+      <pose>0.7 0 -0.3 0 0 0</pose>
+    </model>
+
+    <model name="storage_left">
+      <static>true</static>
+      <include>
+        <uri>model://storage_a_basket</uri>
+      </include>
+      <pose>0 0.55 0.6 0 0 0</pose>
+    </model>
+
+    <model name="storage_right">
+      <static>true</static>
+      <include>
+        <uri>model://storage_b_basket</uri>
+      </include>
+      <pose>0 -0.55 0.6 0 0 0</pose>
+    </model>
+
+    <model name="workspace_basket">
+      <static>true</static>
+      <include>
+        <uri>model://workspace_basket</uri>
+      </include>
+      <pose>0.55 0 0.5 0 0 0</pose>
+    </model>
+
+    <model name="bookshelf">
+      <static>true</static>
+      <include>
+        <uri>model://bookshelf</uri>
+      </include>
+      <pose>0.95 -0.3 0.5 0 0 -1.57</pose>
+    </model>
+
+    
+    <!-- GAZEBO PLUGINS: -->
+    <!-- The following plugins must be activated for the ros2_grasping to effectively work: -->
+
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros>
+        <namespace>/ros2_grasp</namespace>
+        <argument>model_states:=model_states</argument>
+        <argument>link_states:=link_states</argument>
+      </ros>
+      <update_rate>1.0</update_rate>
+    </plugin>
+
+    <plugin name="gazebo_ros_properties" filename="libgazebo_ros_properties.so">
+      <ros>
+        <namespace>/ros2_grasp</namespace>
+      </ros>
+    </plugin>
+
+  </world>
+</sdf>
+
+

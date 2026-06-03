@@ -1,0 +1,16 @@
+material Bookshelf/Label
+{
+  technique
+  {
+    pass
+    {
+      texture_unit
+      {
+        texture bookshelf_label.png
+        
+        # 텍스트가 상판 크기에 맞게 조절되도록 설정 (필요에 따라 조정)
+        scale 1 1
+      }
+    }
+  }
+}

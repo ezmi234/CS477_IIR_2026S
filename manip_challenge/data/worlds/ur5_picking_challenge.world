@@ -1,0 +1,84 @@
+<?xml version="1.0" ?>
+
+<sdf version="1.5">
+
+  <world name="default">
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <scene>
+      <shadows>0</shadows>
+    </scene>
+
+    <model name="ur5_base">
+      <include>
+        <uri>model://ur5_base</uri>
+      </include>
+      <pose>0 0 0 0 0 0</pose>
+    </model>
+
+    <model name="cafe_table_left">
+      <include>
+        <uri>model://ur5_base</uri>
+      </include>
+      <pose>0 0.55 0 0 0 0</pose>
+    </model>
+    
+    <model name="cafe_table_right">
+      <include>
+        <uri>model://ur5_base</uri>
+      </include>
+      <pose>0 -0.55 0 0 0 0</pose>
+    </model>
+    
+    <model name="cafe_table">
+      <static>true</static>
+      <include>
+        <uri>model://cafe_table</uri>
+      </include>
+      <pose>0.7 0 -0.2 0 0 0</pose>
+    </model>
+
+    <model name="storage_left">
+      <static>true</static>
+      <include>
+        <uri>model://storage</uri>
+      </include>
+      <pose>0 0.55 0.6 0 0 0</pose>
+    </model>
+
+    <model name="storage_right">
+      <static>true</static>
+      <include>
+        <uri>model://storage</uri>
+      </include>
+      <pose>0 -0.55 0.6 0 0 0</pose>
+    </model>
+
+    <!-- GAZEBO PLUGINS: -->
+    <!-- The following plugins must be activated for the ros2_grasping to effectively work: -->
+
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros>
+        <namespace>/ros2_grasp</namespace>
+        <argument>model_states:=model_states</argument>
+        <argument>link_states:=link_states</argument>
+      </ros>
+      <update_rate>1.0</update_rate>
+    </plugin>
+
+    <plugin name="gazebo_ros_properties" filename="libgazebo_ros_properties.so">
+      <ros>
+        <namespace>/ros2_grasp</namespace>
+      </ros>
+    </plugin>
+
+  </world>
+</sdf>
+
+

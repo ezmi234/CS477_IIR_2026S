@@ -1,0 +1,13 @@
+material Label/Storage
+{
+  technique
+  {
+    pass
+    {
+      texture_unit
+      {
+        texture label.png
+      }
+    }
+  }
+}
