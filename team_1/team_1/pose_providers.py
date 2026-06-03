@@ -159,10 +159,7 @@ class GroundTruthPoseProvider(PoseProvider):
         out.position.y = float(pose.position.y)
         out.position.z = float(pose.position.z)
         yaw = 0.0
-        if object_name == 'banana':
-            out.position.z += 0.03
-            yaw = 0.0
-        elif object_name == 'hammer':
+        if object_name == 'hammer':
             out.position.x -= 0.04
             out.position.z += 0.02
             yaw = 0.0

@@ -3,7 +3,6 @@ import json
 import math
 import time
 import numpy as np
-import copy
 
 from geometry_msgs.msg import Pose
 from manip_challenge import move_gripper
@@ -13,6 +12,7 @@ from .config import (
     BOOKSHELF_WRIST_FLIP_OBJECTS,
     DEBUG_GROUND_TRUTH_Z_OFFSETS,
     GRIPPER_CLOSE_POSITIONS,
+    HOME_JOINTS,
     OBJECT_PICK_OVERRIDES,
     PICK_APPROACH_HEIGHTS,
     PICK_LIFT_HEIGHTS,
@@ -50,13 +50,26 @@ class PickPlaceMixin:
         else:
             release_z = float(override.get('release_z', config['release_z']))
 
-        # 3. Create a 3x3 virtual grid of test points inside the box boundaries
-        x_test_points = np.linspace(x_start, x_end, 3)
-        y_test_points = np.linspace(y_start, y_end, 3)
+        # 3. Create center-first candidate slots.  The old corner-first grid
+        # often left the arm in awkward postures and could place objects on
+        # storage edges.  Try the center first, then progressively safer inner
+        # offsets before testing near the box boundary.
+        x_mid = 0.5 * (x_start + x_end)
+        y_mid = 0.5 * (y_start + y_end)
+        x_span = abs(x_end - x_start)
+        y_span = abs(y_end - y_start)
+        slot_candidates = [(x_mid, y_mid)]
+        for sx in [0.0, -0.25, 0.25, -0.40, 0.40]:
+            for sy in [0.0, -0.25, 0.25, -0.40, 0.40]:
+                x = x_mid + sx * x_span
+                y = y_mid + sy * y_span
+                if x_start <= x <= x_end and min(y_start, y_end) <= y <= max(y_start, y_end):
+                    pt = (float(x), float(y))
+                    if pt not in slot_candidates:
+                        slot_candidates.append(pt)
 
         # 4. Grid Search: Test each point one by one
-        for x in x_test_points:
-            for y in y_test_points:
+        for x, y in slot_candidates:
                 # Create a virtual pose at this exact (X, Y) grid point
                 test_pose = self.make_tool_pose(x, y, release_z)
                 if override.get('use_grasp_orientation', config.get('use_grasp_orientation', False)) and pick_info.get('grasp_pose') is not None:
@@ -103,6 +116,17 @@ class PickPlaceMixin:
         target_x = object_pose.position.x + dx
         target_y = object_pose.position.y + dy
         target_z = object_pose.position.z + dz
+        if pose_is_grasp:
+            z_min = overrides.get('vision_grasp_z_min')
+            z_max = overrides.get('vision_grasp_z_max')
+            if z_min is not None and z_max is not None:
+                unclamped_z = float(target_z)
+                target_z = min(max(unclamped_z, float(z_min)), float(z_max))
+                if abs(target_z - unclamped_z) > 1e-6:
+                    self.get_logger().warn(
+                        f'Clamped {object_name} vision grasp z: {unclamped_z:.3f} -> {target_z:.3f} '
+                        f'within [{float(z_min):.3f}, {float(z_max):.3f}]'
+                    )
         approach = self.make_tool_pose(
             target_x,
             target_y,
@@ -126,6 +150,8 @@ class PickPlaceMixin:
         descent_duration = float(overrides.get('descent_duration', self.get_parameter('move_duration').value))
         lift_duration = float(overrides.get('lift_duration', self.get_parameter('move_duration').value))
         post_close_sleep = float(overrides.get('post_close_sleep', 0.0))
+        close_force = float(overrides.get('close_force', 1.0))
+        close_timeout = float(overrides.get('close_timeout', 3.0))
 
         pick_plan = {
             'approach_pose': approach,
@@ -139,6 +165,8 @@ class PickPlaceMixin:
             'descent_duration': descent_duration,
             'lift_duration': lift_duration,
             'post_close_sleep': post_close_sleep,
+            'close_force': close_force,
+            'close_timeout': close_timeout,
         }
         self.get_logger().info(
             f'Pick plan for {object_name}: '
@@ -146,7 +174,7 @@ class PickPlaceMixin:
             f'approach={self._pose_summary(approach)}, '
             f'grasp={self._pose_summary(grasp)}, '
             f'retreat={self._pose_summary(retreat)}, '
-            f'close_pos={close_pos:.3f}'
+            f'close_pos={close_pos:.3f}, close_timeout={close_timeout:.1f}'
         )
         return pick_plan
 
@@ -178,7 +206,8 @@ class PickPlaceMixin:
             )
             move_gripper.gripper_close(
                 self,
-                force=1.0,
+                force=float(pick_plan.get('close_force', 1.0)),
+                timeout=int(math.ceil(float(pick_plan.get('close_timeout', 3.0)))),
                 gripper_close_pos=pick_plan['close_pos'],
             )
             if pick_plan.get('post_close_sleep', 0.0) > 0.0:
@@ -288,6 +317,9 @@ class PickPlaceMixin:
 
             self.move_tool_pose(retreat, duration=retreat_duration)
             self.place_counts[destination] = count + 1
+            if bool(override.get('return_home_after_place', config.get('return_home_after_place', False))):
+                self.get_logger().info('Returning to HOME_JOINTS after storage placement.')
+                self.move_joint(HOME_JOINTS, duration=float(override.get('return_home_duration', config.get('return_home_duration', 2.2))))
 
         except RuntimeError as e:
             # If the robot hits the box or fails during the movement, catch the error
@@ -357,6 +389,9 @@ class PickPlaceMixin:
         retreat.position.z += config['retreat_lift_z']
         self.move_tool_pose(retreat, duration=retreat_duration)
         self.place_counts['shelf'] = count + 1
+        if bool(config.get('return_home_after_place', False)):
+            self.get_logger().info('Returning to HOME_JOINTS after shelf placement.')
+            self.move_joint(HOME_JOINTS, duration=float(config.get('return_home_duration', 2.4)))
 
     def needs_bookshelf_wrist_flip(self, object_name):
         base_name = str(object_name).strip().lower().split('_')[0]
@@ -421,6 +456,8 @@ class PickPlaceMixin:
             'retreat_pose': self._pose_to_dict(pick_plan.get('retreat_pose')),
             'gripper_width_estimate': float(pick_plan.get('gripper_width_estimate', 0.0)),
             'close_pos': float(pick_plan.get('close_pos', 0.0)),
+            'close_force': float(pick_plan.get('close_force', 1.0)),
+            'close_timeout': float(pick_plan.get('close_timeout', 3.0)),
             'pose_is_grasp': bool(pick_plan.get('pose_is_grasp', False)),
             'motion_success': bool(success),
             'motion_error': error,

@@ -16,9 +16,9 @@ It does not launch Gazebo. In contest mode, the simulator is launched separately
 ## Build
 
 ```bash
-cd /home/ubuntu/cs477_ws
+cd ~/cs477_ws
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install --packages-up-to team_1
+colcon build --symlink-install --packages-select team_1 --event-handlers console_direct+
 source install/setup.bash
 ```
 
