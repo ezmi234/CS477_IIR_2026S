@@ -186,6 +186,7 @@ class PickPlaceMixin:
         else:
             release_z = float(override.get('release_z', config['release_z']))
             
+        # approach
         approach_z = float(override.get('approach_z', config['approach_z']))
         retreat_z = float(override.get('retreat_z', config['retreat_z']))
         
