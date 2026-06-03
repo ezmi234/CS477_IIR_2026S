@@ -1,0 +1,21 @@
+default:
+  approach_height: 0.12
+  grasp_z_offset: 0.015
+  min_points: 80
+  max_gripper_width: 0.085
+  max_bbox_area_ratio: 0.55
+
+banana:
+  prefer_pca_axis: true
+  yaw_offset: 1.5708
+
+hammer:
+  prefer_pca_axis: true
+
+coke_can:
+  prefer_center_top: true
+  aliases: ["cola can", "red soda can", "red can"]
+
+meat_can:
+  prefer_center_top: true
+  aliases: ["tin can", "food can", "canned food"]
