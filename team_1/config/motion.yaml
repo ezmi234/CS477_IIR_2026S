@@ -1,0 +1,13 @@
+home_joints: [0.0, -1.5707963268, 1.0, -1.0471975512, -1.5707963268, 0.0]
+base_frame: "base_link"
+tool_frame: "robotiq_85_base_link"
+move_duration: 4.0
+startup_wait_timeout: 30.0
+
+pick:
+  approach_height: 0.12
+  lift_height: 0.18
+  grasp_z_offset: -0.015
+  retry_vision_attempts: 3
+
+dry_run_motion: false
