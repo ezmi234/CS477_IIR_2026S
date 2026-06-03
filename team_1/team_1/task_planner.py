@@ -88,5 +88,10 @@ class TaskPlanner:
             return False
         return int(task.attempt) < self.max_task_retries
 
+    def should_retry_task_failure(self, task):
+        if self.mode == self.COMMAND_ORDER:
+            return False
+        return int(task.attempt) < self.max_task_retries
+
     def defer_failed_task(self, task):
         return replace(task, attempt=int(task.attempt) + 1)

@@ -62,6 +62,9 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.declare_parameter('max_task_retries', 1)
         self.declare_parameter('scene_snapshot_enabled', True)
         self.declare_parameter('scene_overlap_threshold', 0.08)
+        self.declare_parameter('completion_check_enabled', True)
+        self.declare_parameter('completion_xy_margin', 0.08)
+        self.declare_parameter('completion_shelf_xy_margin', 0.20)
 
         self.command_queue = deque()
         self.task_queue = deque()
@@ -342,6 +345,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 self.transition_to(ExecutorState.PLACE)
             except Exception as exc:
                 self.get_logger().error(f'Pick failed: {self.current_task.label()}: {exc}')
+                self.requeue_current_task_for_retry('pick failed')
                 self.finish_task(success=False)
                 self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
             return
@@ -353,10 +357,12 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                     self.current_task.destination,
                     self.current_pick_info,
                 )
-                success = True
+                success = self.validate_task_completion(self.current_task)
             except Exception as exc:
                 self.get_logger().error(f'Place failed: {self.current_task.label()}: {exc}')
                 success = False
+            if not success:
+                self.requeue_current_task_for_retry('completion check failed')
             self.finish_task(success=success)
             self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
             return
@@ -406,6 +412,90 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         for note in snapshot.notes[:3]:
             self.get_logger().warn(f'Scene snapshot note: {note}')
         return snapshot
+
+    def validate_task_completion(self, task):
+        if not self.get_parameter('completion_check_enabled').value:
+            return True
+
+        final_pose = self.get_completion_pose(task.object_name)
+        if final_pose is None:
+            self.get_logger().warn(
+                f'Completion check failed: could not detect {task.object_name} after place.'
+            )
+            return False
+
+        completed = self.is_pose_in_destination(final_pose, task.destination)
+        status = 'passed' if completed else 'failed'
+        self.get_logger().info(
+            f'Completion check {status}: {task.label()} final pose '
+            f'x={final_pose.position.x:.3f}, '
+            f'y={final_pose.position.y:.3f}, '
+            f'z={final_pose.position.z:.3f}'
+        )
+        return completed
+
+    def get_completion_pose(self, object_name):
+        pose = self.pose_provider.get_object_pose(object_name)
+        if (
+            self.pose_provider_name == 'vision'
+            and getattr(self.pose_provider, 'latest_pose_stamped', None) is not None
+            and self.pose_provider.latest_pose_stamped.header.frame_id
+        ):
+            center_pose = self.transform_pose_stamped(
+                self.pose_provider.latest_pose_stamped,
+                self.get_parameter('base_frame').value,
+            )
+            if center_pose is not None:
+                return center_pose
+        return pose
+
+    def is_pose_in_destination(self, pose, destination):
+        config = PLACE_CONFIGS.get(destination)
+        if config is None:
+            self.get_logger().warn(f'Completion check has no bounds for {destination}.')
+            return True
+
+        x = float(pose.position.x)
+        y = float(pose.position.y)
+        margin = float(self.get_parameter('completion_xy_margin').value)
+
+        if destination in {'left_storage', 'right_storage'}:
+            x_min, x_max = config['range_x']
+            y_min, y_max = config['range_y']
+            return (
+                float(x_min) - margin <= x <= float(x_max) + margin
+                and float(y_min) - margin <= y <= float(y_max) + margin
+            )
+
+        if destination == 'shelf':
+            shelf_margin = float(self.get_parameter('completion_shelf_xy_margin').value)
+            y_slots = [float(value) for value in config.get('y_slots', [])]
+            y_center = y_slots[0] if y_slots else float(config.get('y', -0.30))
+            return (
+                float(config['x']) - shelf_margin <= x <= float(config['x']) + shelf_margin
+                and min(y_slots or [y_center]) - shelf_margin
+                <= y
+                <= max(y_slots or [y_center]) + shelf_margin
+            )
+
+        self.get_logger().warn(f'Completion check falls back to success for {destination}.')
+        return True
+
+    def requeue_current_task_for_retry(self, reason):
+        if self.current_task is None:
+            return False
+        if not self.task_planner.should_retry_task_failure(self.current_task):
+            return False
+
+        deferred = self.task_planner.defer_failed_task(self.current_task)
+        self.task_queue.append(deferred)
+        self.get_logger().warn(
+            f'Retrying task later because {reason}: {self.current_task.label()} '
+            f'(attempt {self.current_task.attempt + 1}/'
+            f'{self.task_planner.max_task_retries + 1}). '
+            f'Queue depth: {len(self.task_queue)}'
+        )
+        return True
 
     def execute_next_task(self):
         self.run_fsm_once()
