@@ -183,7 +183,11 @@ OBJECT_ALIASES = {
 }
 
 TASK_EXECUTION_PRIORITY = {
-    'strawberry': 0,
+    'coke_can': 0,
+    'meat_can': 1,
+    'strawberry': 2,
+    'hammer': 3,
+    'banana': 4,
 }
 
 DESTINATION_ALIASES = {
