@@ -1,21 +1,61 @@
 default:
-  approach_height: 0.12
-  grasp_z_offset: 0.015
-  min_points: 80
+  strategy: center_top
+  min_points: 45
   max_gripper_width: 0.085
-  max_bbox_area_ratio: 0.55
+  max_bbox_area_ratio: 0.70
+  max_expected_length: 0.42
+  max_expected_width: 0.24
+  max_expected_depth_span: 0.32
+  max_depth_behind_surface: 0.20
+  # Camera-depth offset for the selected RGB-D surface point. Keep close to 0;
+  # the motion layer applies the calibrated final z descent.
+  surface_depth_offset: 0.0
+  min_candidate_score: 0.12
+  candidate_yaw_offsets: [0.0, 1.5708]
 
 banana:
-  prefer_pca_axis: true
-  yaw_offset: 1.5708
+  strategy: banana_mask_distance_transform
+  yellow_hsv_lower: [15, 40, 40]
+  yellow_hsv_upper: [45, 255, 255]
+  min_mask_area: 80
+  min_distance_transform: 2.0
+  local_window_px: 35
+  top_k_candidates: 7
+  min_bbox_edge_margin_px: 4
+  depth_window_px: 6
+  depth_foreground_band_m: 0.12
+  candidate_yaw_offsets: [1.5708, -1.5708]
+  max_expected_width: 0.09
+  min_expected_length: 0.06
+  surface_depth_offset: 0.0
+  approach_height: 0.18
 
 hammer:
-  prefer_pca_axis: true
+  strategy: handle_grasp
+  candidate_offsets_along_axis: [-0.08, -0.05, -0.025, 0.0, 0.025, 0.05, 0.08]
+  candidate_yaw_offsets: [0.0, 1.5708]
+  max_handle_width: 0.065
+  use_largest_cluster: false
+  surface_depth_offset: 0.0
+  approach_height: 0.17
 
 coke_can:
+  strategy: center_top
   prefer_center_top: true
+  candidate_yaw_offsets: [0.0]
+  surface_depth_offset: 0.0
   aliases: ["cola can", "red soda can", "red can"]
 
 meat_can:
+  strategy: center_top
   prefer_center_top: true
+  candidate_yaw_offsets: [0.0]
+  surface_depth_offset: 0.0
   aliases: ["tin can", "food can", "canned food"]
+
+strawberry:
+  strategy: center_top
+  prefer_center_top: true
+  candidate_yaw_offsets: [0.0]
+  min_points: 25
+  surface_depth_offset: 0.0

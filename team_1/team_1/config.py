@@ -37,6 +37,8 @@ PLACE_CONFIGS = {
         'open_timeout': 2.5,
         'post_release_sleep': 0.8,
         'retreat_duration': 1.0,
+        'return_home_after_place': True,
+        'return_home_duration': 2.2,
     },
     'right_storage': {
         'range_x': [-0.124, 0.117],
@@ -53,6 +55,8 @@ PLACE_CONFIGS = {
         'open_timeout': 2.5,
         'post_release_sleep': 0.8,
         'retreat_duration': 1.0,
+        'return_home_after_place': True,
+        'return_home_duration': 2.2,
     },
     'shelf': {
         'x': 0.86,
@@ -66,6 +70,8 @@ PLACE_CONFIGS = {
         'open_timeout': 2.5,
         'post_release_sleep': 0.8,
         'retreat_duration': 2.0,
+        'return_home_after_place': True,
+        'return_home_duration': 2.4,
     },
 }
 
@@ -99,7 +105,11 @@ HARDCODED_PICK_TARGETS = {
 GRIPPER_CLOSE_POSITIONS = {
     'coke_can': math.radians(14),
     'meat_can': math.radians(19),
-    'banana': math.radians(27),
+    # Banana is thin and curved.  The previous value (radians(27) ~= 0.47)
+    # left the Robotiq fingers too open, so the robot could touch/lift near
+    # the banana but fail to pinch it.  Use a tighter close value similar to
+    # the small-object setting.
+    'banana': 0.95,
     'strawberry': 0.8,
     'hammer': 0.8,
 }
@@ -118,9 +128,42 @@ PLACE_APPROACH_HEIGHTS = {
 }
 
 PICK_POSITION_OFFSETS = {
-    'banana': (0.0, 0.0, 0.03),
     'strawberry': (0.0, -0.012, 0.0),
     'hammer': (-0.04, 0.06, 0.0),
+}
+
+OBJECT_PICK_OVERRIDES = {
+    'banana': {
+        'approach_height': 0.18,
+        'lift_height': 0.30,
+        'grasp_z_offset': -0.010,
+        # When the pose already comes from /vision/selected_grasp_base, do not
+        # descend again below it. The vision server already clamps bad depth.
+        # The RGB-D banana affordance returns a point on the visible body.
+        # Descend a little below that surface seed and allow a lower clamp;
+        # otherwise the gripper often closes just above the thin banana.
+        'vision_grasp_z_offset': -0.018,
+        'vision_grasp_z_min': -0.080,
+        'vision_grasp_z_max': -0.025,
+        'close_force': 1.0,
+        'close_timeout': 4.0,
+        'approach_duration': 2.0,
+        'descent_duration': 1.6,
+        'lift_duration': 2.0,
+        'post_close_sleep': 0.35,
+    },
+    'hammer': {
+        'approach_height': 0.18,
+        'lift_height': 0.34,
+        'grasp_z_offset': -0.010,
+        'vision_grasp_z_offset': 0.0,
+        'vision_grasp_z_min': -0.045,
+        'vision_grasp_z_max': 0.040,
+        'approach_duration': 2.1,
+        'descent_duration': 1.7,
+        'lift_duration': 2.2,
+        'post_close_sleep': 0.35,
+    },
 }
 
 STORAGE_OBJECT_OVERRIDES = {
@@ -213,4 +256,16 @@ def _apply_target_config():
             _deep_update(PLACE_CONFIGS[name], values)
 
 
+def _apply_motion_config():
+    motion = _load_package_yaml('motion.yaml')
+    object_pick = motion.get('object_pick', {})
+    if isinstance(object_pick, dict):
+        for name, values in object_pick.items():
+            if isinstance(values, dict):
+                current = dict(OBJECT_PICK_OVERRIDES.get(name, {}))
+                _deep_update(current, values)
+                OBJECT_PICK_OVERRIDES[name] = current
+
+
 _apply_target_config()
+_apply_motion_config()

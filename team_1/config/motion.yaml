@@ -10,4 +10,22 @@ pick:
   grasp_z_offset: -0.015
   retry_vision_attempts: 3
 
+object_pick:
+  banana:
+    approach_height: 0.16
+    lift_height: 0.28
+    grasp_z_offset: -0.010
+    approach_duration: 2.0
+    descent_duration: 1.6
+    lift_duration: 2.0
+    post_close_sleep: 0.35
+  hammer:
+    approach_height: 0.17
+    lift_height: 0.32
+    grasp_z_offset: -0.010
+    approach_duration: 2.1
+    descent_duration: 1.7
+    lift_duration: 2.2
+    post_close_sleep: 0.35
+
 dry_run_motion: false

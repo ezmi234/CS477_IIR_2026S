@@ -92,6 +92,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             depth=10,
         )
         self.create_subscription(String, '/task_commands', self.task_callback, qos)
+        self.grasp_debug_pub = self.create_publisher(String, '/vision/grasp_debug', 10)
 
         service_name = self.get_parameter('detection_service').value
         self.detect_client = self.create_client(StringPose, service_name)
@@ -148,7 +149,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         if self.pose_provider_name == 'hardcoded':
             return HardcodedPoseProvider(self)
         if self.pose_provider_name == 'ground_truth':
-            return GroundTruthPoseProvider(self, self.ground_truth_client)
+            return GroundTruthPoseProvider(self, self.ground_truth_client, self.detect_client)
         if self.pose_provider_name == 'detection':
             return DetectionPoseProvider(self, self.detect_client)
         if self.pose_provider_name == 'vision':

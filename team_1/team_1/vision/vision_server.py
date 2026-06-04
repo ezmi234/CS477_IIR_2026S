@@ -36,7 +36,11 @@ except Exception:
 from riro_srvs.srv import StringPose
 
 from .backends import make_backend
-from .grasp_estimator import DEFAULT_GRASP_CONFIG, estimate_grasp_candidate
+from .grasp_estimator import (
+    DEFAULT_GRASP_CONFIG,
+    estimate_grasp_candidates,
+    fallback_grasp_candidates,
+)
 from .labels import canonical_aliases_for_log, extract_target_label, normalize_label
 from .types import CameraState, Detection
 from .visualization import draw_detections
@@ -84,6 +88,64 @@ def _quat_rotate_vector(q, v):
     return (rx, ry, rz)
 
 
+def _pose_stamped_to_dict(stamped: PoseStamped | None) -> dict[str, Any] | None:
+    if stamped is None:
+        return None
+    p = stamped.pose.position
+    q = stamped.pose.orientation
+    return {
+        "frame_id": stamped.header.frame_id,
+        "position": [float(p.x), float(p.y), float(p.z)],
+        "orientation": [float(q.x), float(q.y), float(q.z), float(q.w)],
+    }
+
+
+def _parse_camera_preferences(values) -> dict[str, str]:
+    """Parse launch/YAML strings like ['banana:top', 'hammer:top']."""
+    out: dict[str, str] = {}
+    if values is None:
+        return out
+    if isinstance(values, str):
+        values = [values]
+    for item in values:
+        text = str(item).strip()
+        if not text or ':' not in text:
+            continue
+        label, camera = text.split(':', 1)
+        label = normalize_label(label.strip())
+        camera = camera.strip().lower()
+        if label and camera:
+            out[label] = camera
+    return out
+
+
+def _parse_base_grasp_safety(values) -> dict[str, tuple[float, float]]:
+    """Parse launch/YAML strings like ['banana:-0.040:0.030'].
+
+    The limits are expressed in base_link z coordinates and are applied only to
+    selected grasp poses after TF.  They are intentionally conservative guards
+    against bad RGB-D depth on thin/curved objects.
+    """
+    out: dict[str, tuple[float, float]] = {}
+    if values is None:
+        return out
+    if isinstance(values, str):
+        values = [values]
+    for item in values:
+        parts = [p.strip() for p in str(item).split(':')]
+        if len(parts) != 3:
+            continue
+        label = normalize_label(parts[0])
+        try:
+            z_min = float(parts[1])
+            z_max = float(parts[2])
+        except ValueError:
+            continue
+        if label and z_min <= z_max:
+            out[label] = (z_min, z_max)
+    return out
+
+
 class VisionServer(Node):
     def __init__(self):
         super().__init__("vision_server")
@@ -96,11 +158,21 @@ class VisionServer(Node):
         #   preferred_then_others -> try preferred first, then fallback cameras.
         #   all                 -> run detection on all ready cameras and select the best scored result.
         self.declare_parameter("camera_selection_mode", "all")
+        # Object-specific camera preference keeps thin/elongated objects stable.
+        # Format: ["banana:top", "hammer:top"].  If the preferred camera
+        # produces a detection above min_return_score, it wins even if another
+        # camera has a slightly higher OWL-ViT score.
+        self.declare_parameter("object_camera_preferences", ["banana:top", "hammer:top"])
+        # Base-link z safety clamps for fragile elongated objects.  Format:
+        # ["label:z_min:z_max"].  This prevents bad depth from sending the
+        # gripper far below the table/object surface.
+        self.declare_parameter("base_grasp_safety", ["banana:-0.040:0.030", "hammer:-0.045:0.040"])
         self.declare_parameter("max_camera_age_sec", 30.0)
         self.declare_parameter("backend_order", ["depth"])
         self.declare_parameter("vision_backend", "")
         self.declare_parameter("future_backend_order", ["yolo", "hf_owlvit"])
         self.declare_parameter("yolo_model_path", "")
+        self.declare_parameter("yolo_conf", 0.15)
         self.declare_parameter("grasp_config_file", "grasp.yaml")
         self.declare_parameter("min_return_score", 0.03)
         self.declare_parameter("device", "cpu")
@@ -120,6 +192,12 @@ class VisionServer(Node):
         self.preferred_camera = str(self.get_parameter("preferred_camera").value)
         self.camera_names = [str(v) for v in self.get_parameter("camera_names").value]
         self.camera_selection_mode = str(self.get_parameter("camera_selection_mode").value).strip().lower()
+        self.object_camera_preferences = _parse_camera_preferences(
+            self.get_parameter("object_camera_preferences").value
+        )
+        self.base_grasp_safety = _parse_base_grasp_safety(
+            self.get_parameter("base_grasp_safety").value
+        )
         self.max_camera_age_sec = float(self.get_parameter("max_camera_age_sec").value)
         self.min_return_score = float(self.get_parameter("min_return_score").value)
         self.debug = bool(self.get_parameter("debug").value)
@@ -148,6 +226,7 @@ class VisionServer(Node):
             "hf_score_threshold": float(self.get_parameter("hf_score_threshold").value),
             "depth_min_area": int(self.get_parameter("depth_min_area").value),
             "yolo_model_path": str(self.get_parameter("yolo_model_path").value),
+            "yolo_conf": float(self.get_parameter("yolo_conf").value),
         }
         backend_value = self.get_parameter("backend_order").value
         if isinstance(backend_value, str):
@@ -173,6 +252,7 @@ class VisionServer(Node):
         self.selected_grasp_pub = self.create_publisher(PoseStamped, "/vision/selected_grasp", 10)
         self.selected_grasp_base_pub = self.create_publisher(PoseStamped, "/vision/selected_grasp_base", 10)
         self.grasp_candidates_pub = self.create_publisher(String, "/vision/grasp_candidates", 10)
+        self.grasp_debug_pub = self.create_publisher(String, "/vision/grasp_debug", 10)
         self.debug_image_pub = self.create_publisher(Image, "/vision/debug_image", 10)
 
         self.status_timer = self.create_timer(2.0, self.log_camera_status)
@@ -265,6 +345,47 @@ class VisionServer(Node):
             parts.append(f"{name}:image={img} cloud={cloud} ready={s.ready(now, self.max_camera_age_sec)}")
         self.get_logger().info("Vision camera status | " + " | ".join(parts))
 
+
+    def select_detection_for_target(self, target: str, detections: list[Detection]) -> Detection | None:
+        if not detections:
+            return None
+        ranked = sorted(detections, key=lambda d: d.effective_score(), reverse=True)
+        preferred_camera = self.object_camera_preferences.get(target)
+        if preferred_camera:
+            preferred = [d for d in ranked if d.camera_name == preferred_camera]
+            if preferred and preferred[0].effective_score() >= self.min_return_score:
+                self.get_logger().info(
+                    f"Object-specific camera preference: target='{target}' -> "
+                    f"camera='{preferred_camera}' selected_score={preferred[0].effective_score():.3f} "
+                    f"global_best_camera='{ranked[0].camera_name}' global_best_score={ranked[0].effective_score():.3f}"
+                )
+                return preferred[0]
+            self.get_logger().warn(
+                f"Object-specific camera preference requested target='{target}' -> "
+                f"camera='{preferred_camera}', but no valid preferred-camera detection was available."
+            )
+        return ranked[0]
+
+    def apply_base_grasp_safety(self, target: str, stamped: PoseStamped | None) -> tuple[PoseStamped | None, dict[str, float | bool]]:
+        info: dict[str, float | bool] = {"applied": False}
+        if stamped is None:
+            return stamped, info
+        limits = self.base_grasp_safety.get(target)
+        if limits is None:
+            return stamped, info
+        z_min, z_max = limits
+        z = float(stamped.pose.position.z)
+        clamped = min(max(z, z_min), z_max)
+        info.update({"z_before": z, "z_after": clamped, "z_min": z_min, "z_max": z_max})
+        if abs(clamped - z) > 1e-6:
+            stamped.pose.position.z = clamped
+            info["applied"] = True
+            self.get_logger().warn(
+                f"Base grasp safety clamp applied for {target}: z {z:.3f} -> {clamped:.3f} "
+                f"within [{z_min:.3f}, {z_max:.3f}]"
+            )
+        return stamped, info
+
     def detect_callback(self, request, response):
         prompt = getattr(request, "data", "")
         target = extract_target_label(prompt, default="object")
@@ -301,9 +422,10 @@ class VisionServer(Node):
 
         # Sort globally. In `all` mode this lets the wrist camera win when it has
         # a better semantic box, while still publishing the frame_id so downstream
-        # code knows how to transform the pose.
-        all_detections.sort(key=lambda d: d.effective_score(), reverse=True)
-        selected = all_detections[0] if all_detections else None
+        # code knows how to transform the pose.  For thin/elongated objects like
+        # banana/hammer, however, top-camera geometry is usually more stable than
+        # wrist-camera close-ups, so allow object-specific camera preference.
+        selected = self.select_detection_for_target(target, all_detections)
         selected_cam = camera_by_name.get(selected.camera_name) if selected is not None else None
 
         if selected is None or selected.effective_score() < self.min_return_score:
@@ -335,6 +457,7 @@ class VisionServer(Node):
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.pose = p
         self.pose_pub.publish(pose_msg)
+        selected_pose_base = self.safe_transform_pose_stamped(pose_msg, self.base_frame)
         selected_json = json.dumps(selected.to_dict())
         self.selected_detection_pub.publish(String(data=selected_json))
 
@@ -342,26 +465,124 @@ class VisionServer(Node):
 
         selected_grasp = None
         selected_grasp_base = None
+        grasp_candidates = []
         grasp_json = ""
         if selected_cam is not None and selected_cam.cloud_msg is not None:
-            selected_grasp = estimate_grasp_candidate(
+            grasp_candidates = estimate_grasp_candidates(
                 selected_cam.image_bgr,
                 selected_cam.cloud_msg,
                 selected.to_dict(),
                 self.grasp_config,
             )
-            if selected_grasp is not None:
+            min_candidate_score = float(
+                self.grasp_config.get("default", {}).get("min_candidate_score", 0.25)
+            )
+            if not grasp_candidates or grasp_candidates[0].score < min_candidate_score:
+                template_candidates = fallback_grasp_candidates(
+                    selected.to_dict(),
+                    self.grasp_config,
+                    frame_id=selected_cam.cloud_msg.header.frame_id,
+                    camera_name=selected_cam.name,
+                )
+                if template_candidates:
+                    best_score = grasp_candidates[0].score if grasp_candidates else 0.0
+                    self.get_logger().warn(
+                        f"Using fallback grasp template for label={selected.label}: "
+                        f"best_rgbd_score={best_score:.3f}, threshold={min_candidate_score:.3f}, "
+                        f"fallback_method={template_candidates[0].method}"
+                    )
+                    grasp_candidates.extend(template_candidates)
+                    grasp_candidates.sort(key=lambda c: c.score, reverse=True)
+
+            if grasp_candidates:
+                selected_grasp = grasp_candidates[0]
                 selected_grasp.pose.header.stamp = self.get_clock().now().to_msg()
                 self.selected_grasp_pub.publish(selected_grasp.pose)
                 selected_grasp_base = self.safe_transform_pose_stamped(selected_grasp.pose, self.base_frame)
+                selected_grasp_base, base_safety_info = self.apply_base_grasp_safety(target, selected_grasp_base)
+                candidate_dicts = [candidate.to_dict() for candidate in grasp_candidates]
                 candidate_dict = selected_grasp.to_dict()
+                candidate_dict["base_grasp_safety"] = base_safety_info
+                if candidate_dicts:
+                    candidate_dicts[0]["base_grasp_safety"] = base_safety_info
                 if selected_grasp_base is not None:
                     self.selected_grasp_base_pub.publish(selected_grasp_base)
                     bp = selected_grasp_base.pose.position
                     candidate_dict["base_frame"] = self.base_frame
                     candidate_dict["grasp_xyz_base"] = [float(bp.x), float(bp.y), float(bp.z)]
-                grasp_json = json.dumps(candidate_dict)
+                    candidate_dict["pose_base"] = _pose_stamped_to_dict(selected_grasp_base)
+                    candidate_dicts[0]["base_frame"] = self.base_frame
+                    candidate_dicts[0]["grasp_xyz_base"] = [float(bp.x), float(bp.y), float(bp.z)]
+                    candidate_dicts[0]["pose_base"] = _pose_stamped_to_dict(selected_grasp_base)
+                grasp_payload = dict(candidate_dict)
+                grasp_payload["selected"] = candidate_dict
+                grasp_payload["candidates"] = candidate_dicts
+                grasp_payload["used_fallback"] = bool(
+                    candidate_dict.get("debug", {}).get("fallback", False)
+                )
+                grasp_payload["transform_success"] = selected_grasp_base is not None
+                grasp_payload["object_center_camera"] = _pose_stamped_to_dict(pose_msg)
+                grasp_payload["object_center_base"] = _pose_stamped_to_dict(selected_pose_base)
+                grasp_json = json.dumps(grasp_payload)
                 self.grasp_candidates_pub.publish(String(data=grasp_json))
+                selected_debug = candidate_dict.get("debug", {}) or {}
+                if selected_debug.get("fallback"):
+                    self.get_logger().warn(
+                        f"Selected grasp uses fallback method={candidate_dict.get('method')} "
+                        f"reason={selected_debug.get('fallback_reason', '')}"
+                    )
+                debug_payload = {
+                    "object_label": selected.label,
+                    "method": candidate_dict.get("method"),
+                    "strategy": selected_debug.get("strategy"),
+                    "detection_score": float(selected.effective_score()),
+                    "camera_name": selected.camera_name,
+                    "source_frame": selected.frame_id,
+                    "bbox_xyxy": list(selected.bbox_xyxy),
+                    "object_center_camera": _pose_stamped_to_dict(pose_msg),
+                    "object_center_base_link": _pose_stamped_to_dict(selected_pose_base),
+                    "mask_area": selected_debug.get("mask_area"),
+                    "mask_source": selected_debug.get("mask_source"),
+                    "distance_transform_max": selected_debug.get("distance_transform_max"),
+                    "distance_transform_value": selected_debug.get("distance_transform_value"),
+                    "selected_pixel": selected_debug.get("selected_pixel") or candidate_dict.get("grasp_uv"),
+                    "selected_xyz_camera": selected_debug.get("selected_xyz_camera") or candidate_dict.get("grasp_xyz"),
+                    "selected_xyz_base": candidate_dict.get("grasp_xyz_base"),
+                    "local_tangent_image": selected_debug.get("local_tangent_image"),
+                    "local_perpendicular_image": selected_debug.get("local_perpendicular_image"),
+                    "yaw_candidates": selected_debug.get("yaw_candidates") or candidate_dict.get("candidate_yaw_values"),
+                    "selected_yaw": selected_debug.get("selected_yaw", candidate_dict.get("yaw")),
+                    "num_valid_depth_points": selected_debug.get("num_valid_depth_points"),
+                    "point_depth_support": selected_debug.get("point_depth_support"),
+                    "reason": selected_debug.get("reason"),
+                    "fallback": bool(selected_debug.get("fallback", False)),
+                    "fallback_from": selected_debug.get("fallback_from"),
+                    "fallback_reason": selected_debug.get("fallback_reason"),
+                    "roi_point_count_before_filtering": candidate_dict.get("debug", {}).get(
+                        "roi_point_count_before_filtering"
+                    ),
+                    "roi_point_count_after_filtering": candidate_dict.get("debug", {}).get(
+                        "roi_point_count_after_filtering"
+                    ),
+                    "estimated_dimensions": candidate_dict.get("debug", {}).get("estimated_dimensions"),
+                    "principal_axis": candidate_dict.get("debug", {}).get("principal_axis"),
+                    "candidate_grasp_poses": [
+                        cand.get("pose_camera") for cand in candidate_dicts
+                    ],
+                    "candidate_yaw_values": [
+                        cand.get("yaw") for cand in candidate_dicts
+                    ],
+                    "selected_grasp_score": float(selected_grasp.score),
+                    "selected_grasp_camera_frame": candidate_dict.get("pose_camera"),
+                    "selected_grasp_base_link": _pose_stamped_to_dict(selected_grasp_base),
+                    "pre_grasp_pose": None,
+                    "final_grasp_pose": _pose_stamped_to_dict(selected_grasp_base),
+                    "gripper_width_estimate": float(selected_grasp.width),
+                    "base_grasp_safety": candidate_dict.get("base_grasp_safety"),
+                    "motion_success": None,
+                    "all_candidates": candidate_dicts,
+                }
+                self.grasp_debug_pub.publish(String(data=json.dumps(debug_payload)))
                 self.get_logger().info(
                     "Vision selected grasp pose: "
                     f"frame={selected_grasp.pose.header.frame_id}, "
@@ -385,6 +606,17 @@ class VisionServer(Node):
                     "source_frame": selected.frame_id,
                     "bbox_xyxy": list(selected.bbox_xyxy),
                     "error": "grasp_estimator_returned_none",
+                })))
+                self.grasp_debug_pub.publish(String(data=json.dumps({
+                    "object_label": selected.label,
+                    "detection_score": float(selected.effective_score()),
+                    "camera_name": selected.camera_name,
+                    "source_frame": selected.frame_id,
+                    "bbox_xyxy": list(selected.bbox_xyxy),
+                    "object_center_camera": _pose_stamped_to_dict(pose_msg),
+                    "object_center_base_link": _pose_stamped_to_dict(selected_pose_base),
+                    "error": "grasp_estimator_returned_none",
+                    "motion_success": None,
                 })))
                 self.get_logger().warn(
                     f"No grasp candidate produced for label={selected.label} camera={selected.camera_name}."

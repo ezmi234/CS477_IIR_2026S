@@ -256,5 +256,5 @@ def make_backend(name: str, params: dict):
         )
     if name == "yolo":
         from .yolo_backend import YoloBackend
-        return YoloBackend(model_path=params.get("yolo_model_path", ""))
+        return YoloBackend(model_path=params.get("yolo_model_path", ""), conf=params.get("yolo_conf", 0.15))
     return None
