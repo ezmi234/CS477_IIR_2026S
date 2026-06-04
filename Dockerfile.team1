@@ -1,0 +1,126 @@
+FROM osrf/ros:humble-desktop
+
+SHELL ["/bin/bash", "-lc"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+# ---------------------------------------------------------------------
+# System / ROS dependencies
+# ---------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip \
+    python3-colcon-common-extensions \
+    python3-rosdep \
+    python3-vcstool \
+    python3-numpy \
+    python3-opencv \
+    python3-cv-bridge \
+    python3-pykdl \
+    git \
+    rsync \
+    build-essential \
+    libgl1 \
+    libglib2.0-0 \
+    ros-humble-control-msgs \
+    ros-humble-trajectory-msgs \
+    ros-humble-tf-transformations \
+    ros-humble-tf2-geometry-msgs \
+    ros-humble-urdfdom-py \
+    ros-humble-kdl-parser \
+    ros-humble-joint-state-publisher \
+    ros-humble-joint-state-publisher-gui \
+    ros-humble-robot-state-publisher \
+    ros-humble-xacro \
+    ros-humble-gazebo-ros-pkgs \
+    ros-humble-gazebo-ros2-control \
+    ros-humble-ros2-control \
+    ros-humble-ros2-controllers \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rosdep init 2>/dev/null || true && rosdep update || true
+
+# ---------------------------------------------------------------------
+# Python dependencies
+#
+# IMPORTANT:
+# Do NOT pip install opencv-python or opencv-python-headless here.
+# ROS Humble cv_bridge works best with Ubuntu apt python3-opencv.
+# ---------------------------------------------------------------------
+RUN python3 -m pip install --no-cache-dir \
+    beautifulsoup4 \
+    pillow \
+    transformers==4.41.2 \
+    huggingface-hub==0.23.5 \
+    tokenizers==0.19.1 \
+    safetensors
+
+# CPU PyTorch: safest for Mac-built linux/amd64 image.
+#RUN python3 -m pip install --no-cache-dir \
+#    torch==2.3.1 torchvision==0.18.1 \
+#    --index-url https://download.pytorch.org/whl/cpu
+
+# CUDA 12.8 alternative, heavier but faster on GPU server:
+RUN python3 -m pip install --no-cache-dir \
+    torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# ---------------------------------------------------------------------
+# Workspace
+# ---------------------------------------------------------------------
+WORKDIR /root/cs477_ws
+RUN mkdir -p /root/cs477_ws/src
+
+COPY . /root/cs477_ws/src/cs477_IIR
+
+RUN rm -rf /root/cs477_ws/src/cs477_IIR/build \
+           /root/cs477_ws/src/cs477_IIR/install \
+           /root/cs477_ws/src/cs477_IIR/log
+
+RUN cd /root/cs477_ws && \
+    source /opt/ros/humble/setup.bash && \
+    rosdep install --from-paths src --ignore-src -r -y || true
+
+RUN cd /root/cs477_ws && \
+    source /opt/ros/humble/setup.bash && \
+    colcon build --symlink-install --packages-up-to team_1 --event-handlers console_direct+
+
+# ---------------------------------------------------------------------
+# Submission README
+# ---------------------------------------------------------------------
+RUN cat > /root/cs477_ws/README_team_1.md <<'EOF'
+# README Team 1 — CS477 IIR Picking Challenge
+
+## Standby launch command
+
+The TA simulator should be launched separately.
+
+Launch the team program with:
+
+    cd /root/cs477_ws
+    source /opt/ros/humble/setup.bash
+    source install/setup.bash
+    ros2 launch team_1 contest_run.launch.py
+
+The system starts in standby mode and waits for task commands on:
+
+    /task_commands
+
+Example local test command:
+
+    ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'Move the banana to the left storage.'}"
+
+## Notes
+
+- Final ROS2 package: team_1
+- Main launch file: team_1/launch/contest_run.launch.py
+- The simulator is expected to be launched separately by the TA.
+- The perception pipeline uses RGB-D camera data and does not use Gazebo internal object-state topics during final runtime.
+EOF
+
+RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc && \
+    echo "source /root/cs477_ws/install/setup.bash" >> /root/.bashrc
+
+WORKDIR /root/cs477_ws
+
+CMD ["bash"]

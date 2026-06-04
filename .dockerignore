@@ -10,3 +10,9 @@ log/
 manip_challenge/key.txt
 team_0/team_0/model/*.onnx
 team_0/team_0/model/*.engine
+*.bag
+*.db3
+*.tar
+*.zip
+datasets
+debug_runs
