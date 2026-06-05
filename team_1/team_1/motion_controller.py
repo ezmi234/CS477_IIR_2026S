@@ -96,6 +96,12 @@ class MotionMixin:
         if not msg.position:
             return
         by_name = dict(zip(msg.name, msg.position))
+        
+        # --- AJOUT INDISPENSABLE POUR LE TEST DE LA PINCE ---
+        self.js_gripper_position = by_name.get('robotiq_85_left_knuckle_joint', f"NOT FOUND: {list(by_name.keys())}")
+        # ----------------------------------------------------
+        
+        self.all_joint_positions = by_name
         if all(name in by_name for name in JOINT_NAMES):
             self.js_joint_name = JOINT_NAMES
             self.js_joint_position = [float(by_name[name]) for name in JOINT_NAMES]

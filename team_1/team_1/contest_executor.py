@@ -2,6 +2,7 @@
 import sys
 import time
 from collections import deque
+from manip_challenge import move_gripper
 
 import rclpy
 from control_msgs.action import FollowJointTrajectory
@@ -137,6 +138,16 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
 
         self.get_logger().info('Standby: waiting for /task_commands')
 
+    def debug_pause(self, test_name):
+        print(f"\n{'='*60}")
+        print(f"🛑 TEST PAUSE : {test_name}")
+        if self.js_joint_position:
+            print(f"📍 Current motor positions: {[round(j, 4) for j in self.js_joint_position]}")
+        else:
+            print("📍 Current positions: UNKNOWN")
+        print(f"{'='*60}")
+        sys.stdout.flush()
+
     def resolve_pose_provider_name(self):
         provider = str(self.get_parameter('pose_provider').value).strip().lower()
         if provider:
@@ -233,6 +244,15 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 'Joint state was not received before startup timeout. '
                 'Using HOME_JOINTS as the initial motion seed.'
             )
+        
+        if self.js_joint_position is None:
+            self.get_logger().warn(
+                'Joint state was not received before startup timeout. '
+                'Using HOME_JOINTS as the initial motion seed.'
+            )
+            
+        # --- TEST 1A: INITIAL POSITION ---
+        self.debug_pause("INITIAL POSITION (Defined by init_joints)")
 
     def run_fsm_once(self):
         if self.state == ExecutorState.STANDBY:
@@ -505,6 +525,9 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         try:
             self.move_joint(HOME_JOINTS, duration=4.0)
             self.home_ready = True
+
+            # --- TEST 1B: RETURN POSITION ---
+            self.debug_pause("RETURN POSITION (After a drop)")
         except Exception as exc:
             self.home_ready = False
             self.get_logger().error(f'Failed to return home after task: {exc}')

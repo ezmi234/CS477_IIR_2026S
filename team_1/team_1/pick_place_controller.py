@@ -1,6 +1,7 @@
 import copy
 import json
 import math
+import sys
 import time
 import numpy as np
 
@@ -28,12 +29,16 @@ class PickPlaceMixin:
         default_offset = self.get_parameter('ground_truth_z_offset').value
         return DEBUG_GROUND_TRUTH_Z_OFFSETS.get(object_name, default_offset)
 
-    def find_reachable_storage_slot(self, config, override, pick_info):
+    def find_reachable_storage_slot(self, destination, config, override, pick_info):
         """
-        Tests multiple points inside the storage box and returns the first (x, y)
-        coordinate that the robotic arm can physically reach without breaking IK.
+        Defines 3 safe slots strictly in the middle of the box (far from edges).
+        Tries empty slots first. If all are full or unreachable, tries them all again.
         """
         import numpy as np
+
+        # Initialize the memory for occupied slots if it doesn't exist yet
+        if not hasattr(self, 'occupied_slots'):
+            self.occupied_slots = {'left_storage': [], 'right_storage': []}
 
         # 1. Define the boundaries of the storage box
         x_start, x_end = config['range_x']
@@ -50,41 +55,44 @@ class PickPlaceMixin:
         else:
             release_z = float(override.get('release_z', config['release_z']))
 
-        # 3. Create center-first candidate slots.  The old corner-first grid
-        # often left the arm in awkward postures and could place objects on
-        # storage edges.  Try the center first, then progressively safer inner
-        # offsets before testing near the box boundary.
+        # 3. Create 3 perfectly centered slots (X is strictly middle, Y is spread)
+        # This keeps the arm far from the edges.
         x_mid = 0.5 * (x_start + x_end)
         y_mid = 0.5 * (y_start + y_end)
-        x_span = abs(x_end - x_start)
         y_span = abs(y_end - y_start)
-        slot_candidates = [(x_mid, y_mid)]
-        for sx in [0.0, -0.25, 0.25, -0.40, 0.40]:
-            for sy in [0.0, -0.25, 0.25, -0.40, 0.40]:
-                x = x_mid + sx * x_span
-                y = y_mid + sy * y_span
-                if x_start <= x <= x_end and min(y_start, y_end) <= y <= max(y_start, y_end):
-                    pt = (float(x), float(y))
-                    if pt not in slot_candidates:
-                        slot_candidates.append(pt)
 
-        # 4. Grid Search: Test each point one by one
-        for x, y in slot_candidates:
-                # Create a virtual pose at this exact (X, Y) grid point
-                test_pose = self.make_tool_pose(x, y, release_z)
-                if override.get('use_grasp_orientation', config.get('use_grasp_orientation', False)) and pick_info.get('grasp_pose') is not None:
-                    test_pose.orientation = copy.deepcopy(pick_info['grasp_pose'].orientation)
+        all_slots = [
+            (float(x_mid), float(y_mid)),                    # Exact center
+            (float(x_mid), float(y_mid - 0.25 * y_span)),    # Center-Top (25% margin from edge)
+            (float(x_mid), float(y_mid + 0.25 * y_span))     # Center-Bottom (25% margin from edge)
+        ]
 
-                # Remove the gripper length offset to get the raw wrist position
-                ee_pose = self.detach_tool(test_pose)
+        # 4. Filter out slots we have already used in this specific box
+        available_slots = [pt for pt in all_slots if pt not in self.occupied_slots.get(destination, [])]
 
-                # 5. THE PREDICTION: Ask the Inverse Kinematics solver if this point is reachable
-                if self.solve_ik(ee_pose) is not None:
-                    # Valid slot found! The math confirms the arm can physically reach this point.
-                    self.get_logger().info(f"Valid reachable slot found at X:{x:.2f}, Y:{y:.2f}")
-                    return (float(x), float(y))
+        # Helper function to test IK for a specific (x, y) to avoid repeating code
+        def is_reachable(test_x, test_y):
+            import copy
+            test_pose = self.make_tool_pose(test_x, test_y, release_z)
+            if override.get('use_grasp_orientation', config.get('use_grasp_orientation', False)) and pick_info.get('grasp_pose') is not None:
+                test_pose.orientation = copy.deepcopy(pick_info['grasp_pose'].orientation)
+            return self.solve_ik(self.detach_tool(test_pose)) is not None
 
-        # If the loop finishes and all points returned None, the box is completely out of reach
+        # 5. FIRST PASS: Try to find a completely EMPTY slot
+        for x, y in available_slots:
+            if is_reachable(x, y):
+                self.get_logger().info(f"Valid EMPTY slot found at X:{x:.2f}, Y:{y:.2f}")
+                # Remember this slot!
+                self.occupied_slots.setdefault(destination, []).append((x, y)) 
+                return (x, y)
+
+        # 6. SECOND PASS (Fallback): If all slots are full or unreachable, try them all again anyway
+        self.get_logger().warn(f"No empty slots for {destination} (or unreachable)! Forcing fallback to the 3 main spots.")
+        for x, y in all_slots:
+            if is_reachable(x, y):
+                self.get_logger().info(f"Fallback slot found at X:{x:.2f}, Y:{y:.2f} (Already occupied, stacking)")
+                return (x, y)
+
         return None
 
     def is_reachable_pick_pose(self, pose):
@@ -242,7 +250,6 @@ class PickPlaceMixin:
         self.place_storage(object_name, destination, pick_info)
 
     def place_storage(self, object_name, destination, pick_info):
-        from manip_challenge import move_gripper
 
         config = PLACE_CONFIGS[destination]
         override = STORAGE_OBJECT_OVERRIDES.get(object_name, {})
@@ -255,8 +262,10 @@ class PickPlaceMixin:
             x = float(override['slot_x'])
             y = y_sign * float(override['slot_y_abs'])
         else:
-            # Dynamically search for a reachable slot instead of blindly picking one
-            slot = self.find_reachable_storage_slot(config, override, pick_info)
+            # Dynamically search for a reachable slot in the 10-slot grid
+            # AJOUTE LE PARAMÈTRE "destination" ICI 👇
+            slot = self.find_reachable_storage_slot(destination, config, override, pick_info)
+            
             if slot is None:
                 self.get_logger().error(f"Cannot physically reach {destination} for {object_name}. Aborting place.")
                 move_gripper.gripper_open(self) # Safety drop
@@ -315,8 +324,26 @@ class PickPlaceMixin:
             if post_release_sleep > 0.0:
                 time.sleep(post_release_sleep)
 
+            # --- TEST 2: GRIPPER CHECK ---
+            print(f"\n{'='*60}")
+            print("🛑 TEST 2: THE GRIPPER MUST BE FULLY OPEN HERE")
+            
+            # Print the single variable
+            gripper_pos = getattr(self, 'js_gripper_position', 'Unknown')
+            if isinstance(gripper_pos, float):
+                print(f"👐 CURRENT GRIPPER VALUE: {round(gripper_pos, 4)}")
+            else:
+                print(f"👐 CURRENT GRIPPER VALUE: {gripper_pos}")
+            
+            print("Check in Gazebo. If you press Enter, the arm will retreat up.")
+            print(f"{'='*60}")
+            sys.stdout.flush()
+            # ----------------------------------------
+
+            # 3. Only AFTER your green light, the robot retreats!
             self.move_tool_pose(retreat, duration=retreat_duration)
             self.place_counts[destination] = count + 1
+
             if bool(override.get('return_home_after_place', config.get('return_home_after_place', False))):
                 self.get_logger().info('Returning to HOME_JOINTS after storage placement.')
                 self.move_joint(HOME_JOINTS, duration=float(override.get('return_home_duration', config.get('return_home_duration', 2.2))))
