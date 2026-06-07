@@ -20,6 +20,8 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     vision_backend = LaunchConfiguration('vision_backend')
+    yolo_model_path = LaunchConfiguration('yolo_model_path')
+    yolo_conf = LaunchConfiguration('yolo_conf')
     camera_selection_mode = LaunchConfiguration('camera_selection_mode')
     preferred_camera = LaunchConfiguration('preferred_camera')
     pose_provider = LaunchConfiguration('pose_provider')
@@ -45,8 +47,18 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'vision_backend',
-            default_value='hf_owlvit',
-            description='Primary vision backend: hf_owlvit, depth, or yolo.',
+            default_value='yolo',
+            description='Primary vision backend: yolo, hf_owlvit, or depth.',
+        ),
+        DeclareLaunchArgument(
+            'yolo_model_path',
+            default_value='package://manip_challenge/best.pt',
+            description='Fine-tuned YOLO checkpoint path. Supports package://package/file.pt.',
+        ),
+        DeclareLaunchArgument(
+            'yolo_conf',
+            default_value='0.10',
+            description='YOLO confidence threshold.',
         ),
         DeclareLaunchArgument(
             'camera_selection_mode',
@@ -139,6 +151,8 @@ def generate_launch_description():
                 {'preferred_camera': preferred_camera},
                 {'camera_selection_mode': camera_selection_mode},
                 {'vision_backend': vision_backend},
+                {'yolo_model_path': yolo_model_path},
+                {'yolo_conf': yolo_conf},
                 {'base_frame': 'base_link'},
                 {'use_sim_time': use_sim_time},
             ],

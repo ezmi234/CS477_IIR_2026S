@@ -59,6 +59,67 @@ Start vision:
 ros2 launch manip_challenge vision_detection.launch.py
 ```
 
+The Team 1 runtime now defaults to the fine-tuned YOLO backend when launched
+through `contest_run.launch.py`.  The checkpoint is expected at:
+
+```bash
+src/cs477_IIR/manip_challenge/best.pt
+```
+
+After `colcon build`, it is installed as:
+
+```bash
+package://manip_challenge/best.pt
+```
+
+Run the YOLO-backed stack:
+
+```bash
+ros2 launch team_1 contest_run.launch.py vision_backend:=yolo
+```
+
+With `vision_backend:=yolo`, the server uses YOLO strictly.  If `ultralytics`
+or `best.pt` is missing, it will report no detection instead of hiding the issue
+behind OWL-ViT fallback.
+
+For ROS2 Humble, install YOLO in a venv and build the ROS entry points from
+that venv:
+
+```bash
+cd ~/cs477_ws_project
+source /opt/ros/humble/setup.bash
+python3 -m venv --system-site-packages ~/cs477_yolo_env
+source ~/cs477_yolo_env/bin/activate
+export PYTHONNOUSERSITE=1
+python -m pip install --upgrade pip
+python -m pip install "numpy<2" "matplotlib<3.9" "opencv-python<4.12" ultralytics
+python -m colcon build --base-paths src/cs477_IIR --packages-select manip_challenge team_1 --symlink-install
+source install/setup.bash
+```
+
+Do not use `pip install --user ultralytics` for this workspace; it can make
+`/usr/bin/python3` load NumPy 2.x beside ROS/Ubuntu modules compiled against
+NumPy 1.x.
+
+YOLO still uses the same service/topics as the previous pipeline.  The selected
+detection JSON includes `backend: "yolo"`, `raw_label`, `score`,
+`bbox_xyxy`, and the RGB-D-derived `center_xyz`.
+
+To compare against the previous semantic backend:
+
+```bash
+ros2 launch team_1 contest_run.launch.py vision_backend:=hf_owlvit
+```
+
+Useful YOLO overrides:
+
+```bash
+ros2 launch team_1 contest_run.launch.py \
+  vision_backend:=yolo \
+  yolo_model_path:=package://manip_challenge/best.pt \
+  yolo_conf:=0.10
+```
+
 Test:
 
 ```bash
@@ -135,6 +196,25 @@ Keep `backend_order: ["hf_owlvit"]` while debugging recognition.  If you add
 `depth` as fallback, the service may return a generic object pose even when the
 semantic detector fails, which is useful for dry-run motion integration but risky
 for final object selection.
+
+For the fine-tuned YOLO path, use:
+
+```yaml
+backend_order: ["yolo", "hf_owlvit"]
+yolo_model_path: "package://manip_challenge/best.pt"
+yolo_conf: 0.10
+```
+
+The YOLO class vocabulary is:
+
+```text
+banana, coke_can, meat_can, strawberry, hammer, biscuits, book, box,
+eraser, glue, mustard_bottle, snacks, soap, soap2, sphere, sticky_notes
+```
+
+YOLO returns detections only for the requested canonical target unless the prompt
+normalizes to `object`.  For example, `snack` and `snacks` both map to the
+trained `snacks` class.
 
 ## V4 multi-camera ranking and frame metadata
 

@@ -40,6 +40,11 @@ install(
     share/${PROJECT_NAME}
 )
 
+install(
+  FILES best.pt
+  DESTINATION share/${PROJECT_NAME}
+)
+
 ament_package()
 
 
@@ -61,4 +66,3 @@ ament_package()
 # # include
 #   ${catkin_INCLUDE_DIRS}
 # )
-

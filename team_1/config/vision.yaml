@@ -24,10 +24,10 @@
     # For semantic tests keep fallback disabled, otherwise the depth backend may
     # return a generic object pose and hide zero-shot failures. For a dry-run
     # integration fallback you can temporarily use ["hf_owlvit", "depth"].
-    backend_order: ["hf_owlvit"]
+    backend_order: ["yolo", "hf_owlvit"]
     future_backend_order: ["yolo", "hf_owlvit"]
-    yolo_model_path: ""
-    yolo_conf: 0.15
+    yolo_model_path: "package://manip_challenge/best.pt"
+    yolo_conf: 0.10
     grasp_config_file: "grasp.yaml"
     base_frame: "base_link"
 

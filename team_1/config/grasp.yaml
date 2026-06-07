@@ -35,6 +35,12 @@ hammer:
   candidate_offsets_along_axis: [-0.08, -0.05, -0.025, 0.0, 0.025, 0.05, 0.08]
   candidate_yaw_offsets: [0.0, 1.5708]
   max_handle_width: 0.065
+  max_candidate_width_factor: 1.30
+  max_bbox_area_ratio: 0.45
+  max_expected_length: 0.42
+  max_expected_width: 0.24
+  require_handle_segment: true
+  reject_oversized_geometry: true
   use_largest_cluster: false
   surface_depth_offset: 0.0
   approach_height: 0.17

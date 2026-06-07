@@ -18,8 +18,42 @@ It does not launch Gazebo. In contest mode, the simulator is launched separately
 ```bash
 cd ~/cs477_ws
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install --packages-select team_1 --event-handlers console_direct+
+python -m colcon build --symlink-install --packages-select team_1 --event-handlers console_direct+
 source install/setup.bash
+```
+
+For the YOLO backend, use a ROS-compatible virtual environment instead of
+`pip --user`.  This keeps YOLO dependencies away from Ubuntu/ROS Python
+packages while still allowing imports such as `rclpy` and `cv_bridge`.
+
+```bash
+cd ~/cs477_ws_project
+source /opt/ros/humble/setup.bash
+
+python3 -m venv --system-site-packages ~/cs477_yolo_env
+source ~/cs477_yolo_env/bin/activate
+export PYTHONNOUSERSITE=1
+
+python -m pip install --upgrade pip
+python -m pip install "numpy<2" "matplotlib<3.9" "opencv-python<4.12" ultralytics
+
+python -m colcon build --base-paths src/cs477_IIR \
+  --packages-select manip_challenge team_1 \
+  --symlink-install
+source install/setup.bash
+```
+
+Confirm the generated ROS entry point uses the venv:
+
+```bash
+head -1 install/team_1/lib/team_1/vision_server
+```
+
+Then verify imports:
+
+```bash
+python -c "import numpy; print(numpy.__version__)"
+python -c "import rclpy, cv_bridge; from ultralytics import YOLO; print('YOLO ROS imports OK')"
 ```
 
 ## Standby Runtime
@@ -33,7 +67,9 @@ Useful launch arguments:
 ```bash
 ros2 launch team_1 contest_run.launch.py \
   use_sim_time:=true \
-  vision_backend:=hf_owlvit \
+  vision_backend:=yolo \
+  yolo_model_path:=package://manip_challenge/best.pt \
+  yolo_conf:=0.10 \
   camera_selection_mode:=all \
   preferred_camera:=top \
   pose_provider:=vision \
@@ -58,7 +94,8 @@ ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'Move the banan
 
 ## Vision
 
-Current baseline is OWL-ViT over RGB-D camera data. The runtime uses top and wrist cameras and publishes:
+Current baseline is the fine-tuned YOLO checkpoint over RGB-D camera data. The
+runtime uses top and wrist cameras and publishes:
 
 - `/vision/selected_detection`
 - `/vision/selected_pose`
@@ -67,7 +104,21 @@ Current baseline is OWL-ViT over RGB-D camera data. The runtime uses top and wri
 - `/vision/grasp_candidates`
 - `/vision/debug_image`
 
-YOLO is a placeholder backend only. If `vision_backend:=yolo` is selected without an installed model/dependency, it prints a warning and the server also keeps OWL-ViT in the backend order.
+When `vision_backend:=yolo` is selected, YOLO is strict: if `ultralytics` or
+`best.pt` is unavailable, the server reports no detection instead of silently
+falling back to OWL-ViT. To compare the older zero-shot path, launch with:
+
+```bash
+ros2 launch team_1 contest_run.launch.py vision_backend:=hf_owlvit
+```
+
+Make sure this workspace is built from the activated venv and sourced before
+launching:
+
+```bash
+python -m colcon build --base-paths src/cs477_IIR --packages-select manip_challenge team_1 --symlink-install
+source install/setup.bash
+```
 
 Keep NumPy below 2.x in this ROS Humble container because `cv_bridge` may break with NumPy 2.x.
 
