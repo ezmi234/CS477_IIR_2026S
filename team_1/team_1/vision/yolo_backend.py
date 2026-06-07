@@ -10,20 +10,45 @@ from __future__ import annotations
 
 import os
 
+from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
+
 from .labels import normalize_label
 from .pointcloud import median_xyz_in_bbox, pointcloud2_to_xyz_image
 from .types import Detection
+
+
+def resolve_model_path(model_path: str) -> str:
+    """Resolve ROS package:// paths to an on-disk checkpoint."""
+    path = str(model_path or "").strip()
+    if not path:
+        return ""
+    if path.startswith("package://"):
+        rest = path[len("package://"):]
+        package_name, _, relative_path = rest.partition("/")
+        if not package_name or not relative_path:
+            return path
+        try:
+            share_dir = get_package_share_directory(package_name)
+        except PackageNotFoundError:
+            return path
+        return os.path.join(share_dir, relative_path)
+    return os.path.expanduser(path)
 
 
 class YoloBackend:
     name = "yolo"
 
     def __init__(self, model_path: str = "", conf: float = 0.15):
-        self.model_path = str(model_path or "").strip()
+        self.model_path = resolve_model_path(model_path)
         self.conf = float(conf)
         self._warned = False
         self._model = None
         self._loaded = False
+        if self.model_path:
+            print(
+                f"[vision][yolo] checkpoint={self.model_path} "
+                f"exists={os.path.exists(self.model_path)} conf={self.conf:.2f}"
+            )
 
     def _warn_once(self, message: str):
         if not self._warned:
@@ -37,12 +62,12 @@ class YoloBackend:
         if not self.model_path:
             self._warn_once("YOLO backend requested but yolo_model_path is empty.")
             return False
-        if not os.path.exists(os.path.expanduser(self.model_path)):
+        if not os.path.exists(self.model_path):
             self._warn_once(f"YOLO model not found: {self.model_path}")
             return False
         try:
             from ultralytics import YOLO
-            self._model = YOLO(os.path.expanduser(self.model_path))
+            self._model = YOLO(self.model_path)
             self._warn_once(f"Loaded YOLO model: {self.model_path}")
             return True
         except Exception as exc:

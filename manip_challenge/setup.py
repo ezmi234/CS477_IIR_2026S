@@ -10,7 +10,7 @@ package_name = 'manip_challenge'
 data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name, ['package.xml', 'best.pt']),
     ]
 
 def package_files(data_files, directory_list):

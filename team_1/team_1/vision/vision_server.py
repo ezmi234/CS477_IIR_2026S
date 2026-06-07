@@ -19,7 +19,7 @@ from ament_index_python.packages import get_package_share_directory
 import rclpy
 import rclpy.duration
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose, PoseStamped
@@ -36,6 +36,7 @@ except Exception:
 from riro_srvs.srv import StringPose
 
 from .backends import make_backend
+from .pointcloud import depth_image_to_organized_cloud, depth_topic_from_cloud_topic
 from .grasp_estimator import (
     DEFAULT_GRASP_CONFIG,
     estimate_grasp_candidates,
@@ -209,16 +210,29 @@ class VisionServer(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.grasp_config = self.load_grasp_config()
 
-        qos = QoSProfile(depth=5)
-        qos.reliability = ReliabilityPolicy.BEST_EFFORT
+        sensor_qos = qos_profile_sensor_data
 
         for name in self.camera_names:
             rgb_topic = str(self.get_parameter(f"{name}_rgb_topic").value)
             cloud_topic = str(self.get_parameter(f"{name}_cloud_topic").value)
+            depth_topic = depth_topic_from_cloud_topic(cloud_topic)
 
-            self.create_subscription(Image, rgb_topic, lambda msg, n=name: self.image_callback(n, msg), qos)
-            self.create_subscription(PointCloud2, cloud_topic, lambda msg, n=name: self.cloud_callback(n, msg), qos)
-            self.get_logger().info(f"Subscribed camera '{name}': rgb={rgb_topic}, cloud={cloud_topic}")
+            self.create_subscription(
+                Image, rgb_topic, lambda msg, n=name: self.image_callback(n, msg), sensor_qos
+            )
+            self.create_subscription(
+                PointCloud2, cloud_topic, lambda msg, n=name: self.cloud_callback(n, msg), sensor_qos
+            )
+            if depth_topic:
+                self.create_subscription(
+                    Image,
+                    depth_topic,
+                    lambda msg, n=name: self.depth_callback(n, msg),
+                    sensor_qos,
+                )
+            self.get_logger().info(
+                f"Subscribed camera '{name}': rgb={rgb_topic}, cloud={cloud_topic}, depth={depth_topic or 'n/a'}"
+            )
 
         params = {
             "device": str(self.get_parameter("device").value),
@@ -303,6 +317,19 @@ class VisionServer(Node):
     def cloud_callback(self, camera_name: str, msg: PointCloud2):
         state = self.cameras[camera_name]
         state.cloud_msg = msg
+        state.cloud_source = "pointcloud2"
+        state.cloud_stamp_sec = stamp_to_sec(msg.header.stamp)
+
+    def depth_callback(self, camera_name: str, msg: Image):
+        """Fallback RGB-D path when Gazebo delays point-cloud publication."""
+        state = self.cameras[camera_name]
+        if isinstance(state.cloud_msg, PointCloud2):
+            return
+        organized = depth_image_to_organized_cloud(msg)
+        if organized is None:
+            return
+        state.cloud_msg = organized
+        state.cloud_source = organized.source
         state.cloud_stamp_sec = stamp_to_sec(msg.header.stamp)
 
     def now_sec(self) -> float:
@@ -341,7 +368,10 @@ class VisionServer(Node):
         for name in self.camera_names:
             s = self.cameras[name]
             img = "ok" if s.image_bgr is not None else "no"
-            cloud = "ok" if s.cloud_msg is not None else "no"
+            cloud = "no"
+            if s.cloud_msg is not None:
+                source = getattr(s, "cloud_source", "unknown")
+                cloud = "ok" if source == "pointcloud2" else f"ok({source})"
             parts.append(f"{name}:image={img} cloud={cloud} ready={s.ready(now, self.max_camera_age_sec)}")
         self.get_logger().info("Vision camera status | " + " | ".join(parts))
 

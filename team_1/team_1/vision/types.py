@@ -36,6 +36,7 @@ class CameraState:
     name: str
     image_bgr: Optional[np.ndarray] = None
     cloud_msg: object | None = None
+    cloud_source: str = ""
     image_stamp_sec: float = 0.0
     cloud_stamp_sec: float = 0.0
 

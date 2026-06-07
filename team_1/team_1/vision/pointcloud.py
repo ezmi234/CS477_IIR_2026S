@@ -11,7 +11,25 @@ from typing import Optional
 
 import numpy as np
 import sensor_msgs_py.point_cloud2 as pc2
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import Image, PointCloud2
+
+
+# D435 intrinsics used by the Gazebo RealSense plugin in this workspace.
+_DEFAULT_FX = 463.8
+_DEFAULT_FY = 463.8
+_DEFAULT_CX = 320.0
+_DEFAULT_CY = 240.0
+
+
+@dataclass
+class OrganizedCloud:
+    """Depth-image fallback when Gazebo point-cloud transport has no subscribers."""
+
+    header: object
+    xyz_image: np.ndarray
+    height: int
+    width: int
+    source: str = "depth_image"
 
 
 @dataclass
@@ -27,6 +45,59 @@ class RoiPointCloud:
     debug: dict = field(default_factory=dict)
 
 
+def depth_topic_from_cloud_topic(cloud_topic: str) -> str:
+    topic = str(cloud_topic or "").strip()
+    if topic.endswith("/points"):
+        return topic[: -len("/points")] + "/image_raw"
+    return ""
+
+
+def depth_image_to_organized_cloud(
+    depth_msg: Image,
+    *,
+    fx: float = _DEFAULT_FX,
+    fy: float = _DEFAULT_FY,
+    cx: float = _DEFAULT_CX,
+    cy: float = _DEFAULT_CY,
+) -> Optional[OrganizedCloud]:
+    """Build an organized optical-frame xyz image from a simulated depth frame."""
+    if depth_msg is None or depth_msg.height == 0 or depth_msg.width == 0:
+        return None
+    try:
+        from cv_bridge import CvBridge
+
+        bridge = CvBridge()
+        if depth_msg.encoding in ("16UC1", "mono16"):
+            depth_mm = bridge.imgmsg_to_cv2(depth_msg, desired_encoding="16UC1")
+            z = depth_mm.astype(np.float32) * 0.001
+        elif depth_msg.encoding in ("32FC1",):
+            z = bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1").astype(np.float32)
+        else:
+            depth_raw = bridge.imgmsg_to_cv2(depth_msg)
+            z = depth_raw.astype(np.float32)
+            if depth_msg.encoding in ("16UC1", "mono16"):
+                z *= 0.001
+    except Exception:
+        return None
+
+    h, w = z.shape[:2]
+    u = np.arange(w, dtype=np.float32)
+    v = np.arange(h, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v)
+    safe_z = np.where(z > 0.0, z, np.nan)
+    x = (uu - float(cx)) * safe_z / float(fx)
+    y = (vv - float(cy)) * safe_z / float(fy)
+    xyz = np.stack([x, y, safe_z], axis=-1)
+    xyz = np.nan_to_num(xyz, nan=0.0, posinf=0.0, neginf=0.0)
+    return OrganizedCloud(
+        header=depth_msg.header,
+        xyz_image=xyz,
+        height=int(h),
+        width=int(w),
+        source="depth_image",
+    )
+
+
 def pointcloud2_to_xyz_image(msg: PointCloud2) -> Optional[np.ndarray]:
     """Return an organized HxWx3 xyz array from a PointCloud2 message."""
     if isinstance(msg, np.ndarray):
@@ -36,7 +107,7 @@ def pointcloud2_to_xyz_image(msg: PointCloud2) -> Optional[np.ndarray]:
         return None
 
     if hasattr(msg, "xyz_image"):
-        arr = np.asarray(getattr(msg, "xyz_image"), dtype=np.float32)
+        arr = np.asarray(msg.xyz_image, dtype=np.float32)
         if arr.ndim == 3 and arr.shape[2] >= 3:
             return arr[:, :, :3]
         return None

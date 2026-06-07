@@ -1,4 +1,3 @@
-@@ -1,50 +1,30 @@
 <?xml version="1.0"?>
 
 <!--
@@ -9,7 +8,7 @@ This is the Gazebo URDF model for the Intel RealSense D435 camera
 -->
   
 <robot xmlns:xacro="http://ros.org/wiki/xacro">
-
+  
   <xacro:macro name="gazebo_d435" params="camera_name reference_link topics_ns depth_optical_frame color_optical_frame infrared1_optical_frame infrared2_optical_frame publish_pointcloud:=true" >
 
     <!-- Load parameters to model's main link-->
@@ -49,7 +48,10 @@ This is the Gazebo URDF model for the Intel RealSense D435 camera
           </clip>
           <noise>
             <type>gaussian</type>
-@@ -55,108 +35,23 @@ This is the Gazebo URDF model for the Intel RealSense D435 camera
+            <mean>0.0</mean>
+            <stddev>0.007</stddev>
+          </noise>
+        </camera>
         <always_on>1</always_on>
         <update_rate>30</update_rate>
         <visualize>1</visualize>
