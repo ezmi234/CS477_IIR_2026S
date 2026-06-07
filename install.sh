@@ -31,8 +31,8 @@ sudo dpkg -i ./src/cs477_IIR/ros-humble-roboticsgroup-upatras-gazebo-plugins_0.2
 
 export PYTHONNOUSERSITE=1
 
-colcon build --symlink-install --packages-ignore gazebo_plugins realsense_gazebo_plugin gym-gazebo2 gazebo_ros --allow-overriding gazebo_dev gazebo_msgs gazebo_ros --cmake-args -DBUILD_TESTING=OFF
-colcon build --symlink-install --packages-select gazebo_plugins realsense_gazebo_plugin --packages-skip gazebo_ros --allow-overriding gazebo_plugins --parallel-workers=1 --cmake-args -DCMAKE_CXX_FLAGS="--param ggc-min-expand=20" --cmake-args -DBUILD_TESTING=OFF
+colcon build --symlink-install --packages-ignore gazebo_plugins realsense_gazebo_plugin gym-gazebo2 gazebo_ros --allow-overriding gazebo_dev gazebo_msgs gazebo_ros --cmake-args -DBUILD_TESTING=OFF --parallel-workers=2
+colcon build --symlink-install --packages-select gazebo_plugins realsense_gazebo_plugin --packages-skip gazebo_ros --allow-overriding gazebo_plugins --parallel-workers=1 --cmake-args -DCMAKE_CXX_FLAGS="--param ggc-min-expand=20" --cmake-args -DBUILD_TESTING=OFF --parallel-workers=2
 source ./install/local_setup.bash
 
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
