@@ -25,6 +25,8 @@ class SnapshotCollector(Node):
         rgb_topic: str,
         debug_topic: str,
         detection_topic: str,
+        all_detections_topic: str,
+        ranking_topic: str,
         grasp_topic: str,
         cloud_topic: str,
         out_dir: str,
@@ -41,6 +43,8 @@ class SnapshotCollector(Node):
         self.latest_debug = None
         self.latest_cloud = None
         self.latest_detection_json = ""
+        self.latest_all_detections_json = ""
+        self.latest_ranking_json = ""
         self.latest_grasp_json = ""
 
         qos = QoSProfile(depth=5)
@@ -50,6 +54,8 @@ class SnapshotCollector(Node):
         if cloud_topic:
             self.create_subscription(PointCloud2, cloud_topic, self.cloud_cb, qos)
         self.create_subscription(String, detection_topic, self.detection_cb, 10)
+        self.create_subscription(String, all_detections_topic, self.all_detections_cb, 10)
+        self.create_subscription(String, ranking_topic, self.ranking_cb, 10)
         self.create_subscription(String, grasp_topic, self.grasp_cb, 10)
         self.get_logger().info(
             f"Saving vision snapshots to {self.out_dir} "
@@ -67,6 +73,12 @@ class SnapshotCollector(Node):
 
     def detection_cb(self, msg: String):
         self.latest_detection_json = msg.data
+
+    def all_detections_cb(self, msg: String):
+        self.latest_all_detections_json = msg.data
+
+    def ranking_cb(self, msg: String):
+        self.latest_ranking_json = msg.data
 
     def grasp_cb(self, msg: String):
         self.latest_grasp_json = msg.data
@@ -87,12 +99,21 @@ class SnapshotCollector(Node):
                 cv2.imwrite(str(self.out_dir / f"{stem}_debug.png"), self.latest_debug)
 
             detection = self._parse_json(self.latest_detection_json)
+            all_detections = self._parse_json(self.latest_all_detections_json)
+            ranking = self._parse_json(self.latest_ranking_json)
             grasp = self._parse_json(self.latest_grasp_json)
+            cloud_summary = self._cloud_summary()
             metadata = {
                 "label": self.label,
+                "target_label": self.label,
                 "rgb": rgb_path.name,
+                "debug_image": f"{stem}_debug.png" if self.latest_debug is not None else None,
                 "detection": detection,
+                "selected_candidate": detection,
+                "all_detections": all_detections,
+                "candidate_ranking": ranking,
                 "grasp": grasp,
+                "cloud_summary": cloud_summary,
             }
             (self.out_dir / f"{stem}.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -103,6 +124,8 @@ class SnapshotCollector(Node):
                 if crop.size > 0:
                     cv2.imwrite(str(self.out_dir / f"{stem}_crop.png"), crop)
                 self._save_roi_pointcloud(stem, bbox)
+                if self._detection_accepted(detection):
+                    self._save_yolo_annotation(stem, bbox, image.shape[1], image.shape[0])
 
             self.count += 1
             self.get_logger().info(f"saved {self.count}/{self.max_images}: {stem}")
@@ -127,6 +150,15 @@ class SnapshotCollector(Node):
             return None
         return tuple(max(0, int(round(float(v)))) for v in bbox)
 
+    @staticmethod
+    def _detection_accepted(detection):
+        if not isinstance(detection, dict):
+            return False
+        verification = detection.get("verification")
+        if isinstance(verification, dict):
+            return bool(verification.get("accepted", True))
+        return bool(detection.get("reject_reason") in (None, ""))
+
     def _save_roi_pointcloud(self, stem: str, bbox):
         if self.latest_cloud is None or bbox is None:
             return
@@ -147,28 +179,80 @@ class SnapshotCollector(Node):
         except Exception as exc:
             self.get_logger().warn(f"ROI point cloud save failed: {exc}")
 
+    def _cloud_summary(self):
+        if self.latest_cloud is None:
+            return None
+        xyz = pointcloud2_to_xyz_image(self.latest_cloud)
+        if xyz is None:
+            return None
+        try:
+            import numpy as np
+
+            valid = np.isfinite(xyz[:, :, 0]) & np.isfinite(xyz[:, :, 1]) & np.isfinite(xyz[:, :, 2]) & (xyz[:, :, 2] > 0.05)
+            count = int(np.count_nonzero(valid))
+            if count == 0:
+                return {"valid_point_count": 0}
+            pts = xyz[valid]
+            return {
+                "valid_point_count": count,
+                "xyz_min": [float(v) for v in np.nanmin(pts, axis=0).tolist()],
+                "xyz_max": [float(v) for v in np.nanmax(pts, axis=0).tolist()],
+                "xyz_median": [float(v) for v in np.nanmedian(pts, axis=0).tolist()],
+            }
+        except Exception as exc:
+            self.get_logger().warn(f"Cloud summary failed: {exc}")
+            return None
+
+    def _save_yolo_annotation(self, stem: str, bbox, image_width: int, image_height: int):
+        class_id = _class_id(self.label)
+        if class_id is None:
+            return
+        x1, y1, x2, y2 = bbox
+        width = max(1, int(image_width))
+        height = max(1, int(image_height))
+        cx = ((x1 + x2) * 0.5) / width
+        cy = ((y1 + y2) * 0.5) / height
+        bw = max(0.0, float(x2 - x1) / width)
+        bh = max(0.0, float(y2 - y1) / height)
+        line = f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n"
+        (self.out_dir / f"{stem}.txt").write_text(line, encoding="utf-8")
+
+
+def _class_id(label: str):
+    classes = ["coke_can", "meat_can", "strawberry", "banana", "hammer"]
+    normalized = str(label or "").strip().lower().replace(" ", "_")
+    if normalized not in classes:
+        return None
+    return classes.index(normalized)
+
 
 def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--rgb-topic", default="/camera/camera/color/image_raw")
     parser.add_argument("--debug-topic", default="/vision/debug_image")
     parser.add_argument("--detection-topic", default="/vision/selected_detection")
+    parser.add_argument("--all-detections-topic", default="/vision/detections")
+    parser.add_argument("--ranking-topic", default="/vision/candidate_ranking")
     parser.add_argument("--grasp-topic", default="/vision/grasp_candidates")
     parser.add_argument("--cloud-topic", default="/camera/camera/depth/color/points")
     parser.add_argument("--out-dir", default="/home/ubuntu/cs477_ws/datasets/vision_snapshots")
+    parser.add_argument("--object", dest="object_name", default="")
     parser.add_argument("--label", default="unlabeled")
     parser.add_argument("--max-images", type=int, default=100)
     parsed, ros_args = parser.parse_known_args(args=args)
 
     rclpy.init(args=ros_args)
+    label = parsed.object_name or parsed.label
     node = SnapshotCollector(
         parsed.rgb_topic,
         parsed.debug_topic,
         parsed.detection_topic,
+        parsed.all_detections_topic,
+        parsed.ranking_topic,
         parsed.grasp_topic,
         parsed.cloud_topic,
         parsed.out_dir,
-        parsed.label,
+        label,
         parsed.max_images,
     )
     try:

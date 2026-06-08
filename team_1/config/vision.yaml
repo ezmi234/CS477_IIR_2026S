@@ -25,9 +25,39 @@
     # return a generic object pose and hide zero-shot failures. For a dry-run
     # integration fallback you can temporarily use ["hf_owlvit", "depth"].
     backend_order: ["hf_owlvit"]
-    future_backend_order: ["yolo", "hf_owlvit"]
-    yolo_model_path: ""
-    yolo_conf: 0.15
+    allow_backend_fallback: true
+    backend_debug: true
+    save_debug_images: false
+    debug_dir: "/home/ubuntu/cs477_ws/debug_runs/vision_debug"
+    future_backend_order: ["hf_owlvit"]
+    warmup_on_start: true
+    top_camera_min_final_score: 0.55
+    tf_exact_timeout_sec: 0.08
+    tf_latest_timeout_sec: 0.06
+    tf_candidate_budget_sec: 0.30
+    ranking_request_budget_sec: 1.0
+    grounding_dino_enabled: false
+    grounding_dino_model_id: "IDEA-Research/grounding-dino-base"
+    grounding_dino_text_prompt: "coke can. meat can. banana. hammer. strawberry."
+    grounding_dino_box_threshold: 0.25
+    grounding_dino_text_threshold: 0.20
+    grounding_dino_device: "auto"
+    grounding_dino:
+      enabled: true
+      model_id: "IDEA-Research/grounding-dino-base"
+      text_prompt: "coke can. meat can. banana. hammer. strawberry."
+      box_threshold: 0.25
+      text_threshold: 0.20
+      device: "auto"
+    yolo_enabled: false
+    yolo_model_path: "/home/ubuntu/cs477_ws/src/cs477_IIR/team_1/models/yolo_five_objects_best.pt"
+    yolo_conf: 0.05
+    yolo_device: "auto"
+    yolo:
+      enabled: true
+      model_path: "/home/ubuntu/cs477_ws/src/cs477_IIR/team_1/models/yolo_five_objects_best.pt"
+      confidence_threshold: 0.05
+      device: "auto"
     grasp_config_file: "grasp.yaml"
     base_frame: "base_link"
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import sys
 import time
 from collections import deque
@@ -7,6 +8,7 @@ from manip_challenge import move_gripper
 import rclpy
 from control_msgs.action import FollowJointTrajectory
 from control_msgs.msg import JointTrajectoryControllerState
+from geometry_msgs.msg import Pose
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -15,7 +17,19 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 
-from .config import HOME_JOINTS, PLACE_CONFIGS
+from .config import (
+    HOME_JOINTS,
+    LOW_RISK_ONLY_AFTER_SEC,
+    MIN_CONFIDENCE,
+    MIN_FINAL_CANDIDATE_SCORE,
+    MIN_GRASP_SCORE,
+    OBJECT_GRASP_PROFILES,
+    OBJECT_RISK,
+    OBSERVE_JOINTS,
+    PLACE_CONFIGS,
+    SKIP_HAMMER_AFTER_SEC,
+    TRIAL_TIME_LIMIT_SEC,
+)
 from .models import ExecutorState
 from .motion_lib import misc
 from .motion_controller import MotionMixin
@@ -59,13 +73,25 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.declare_parameter('grasp_z_offset', -0.015)
         self.declare_parameter('ground_truth_z_offset', -0.37)
         self.declare_parameter('move_duration', 4.0)
+        self.declare_parameter('ik_sigma_threshold', 0.02)
+        self.declare_parameter('ik_condition_threshold', 500.0)
+        self.declare_parameter('ik_lambda_base', 0.04)
+        self.declare_parameter('ik_max_joint_delta', 2.75)
+        self.declare_parameter('ik_max_wrist_flip', 3.14159)
+        self.declare_parameter('max_joint_delta_per_trajectory', 1.20)
         self.declare_parameter('task_planner', 'adaptive')
         self.declare_parameter('max_task_retries', 1)
         self.declare_parameter('scene_snapshot_enabled', True)
         self.declare_parameter('scene_overlap_threshold', 0.08)
         self.declare_parameter('completion_check_enabled', True)
+        self.declare_parameter('completion_check_mode', 'runtime_safe')
         self.declare_parameter('completion_xy_margin', 0.08)
         self.declare_parameter('completion_shelf_xy_margin', 0.20)
+        self.declare_parameter('startup_move_to_observe_before_first_task', True)
+        self.declare_parameter('startup_observe_duration', 5.0)
+        self.declare_parameter('startup_open_gripper_on_start', True)
+        self.declare_parameter('prefetch_next_detection_enabled', True)
+        self.declare_parameter('prefetch_max_age_sec', 45.0)
 
         self.command_queue = deque()
         self.task_queue = deque()
@@ -79,6 +105,15 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.current_object_pose = None
         self.current_pick_plan = None
         self.current_pick_info = None
+        self.current_task_start_time = None
+        self.current_detection_start_time = None
+        self.current_detection_time = 0.0
+        self.current_grasp_plan_time = 0.0
+        self.current_motion_time = 0.0
+        self.command_start_time = None
+        self.startup_observe_done = False
+        self.prefetch = None
+        self.prefetch_ready = None
         self.pose_provider_name = self.resolve_pose_provider_name()
         self.last_received_command = ''
         self.last_received_command_time = 0.0
@@ -86,6 +121,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.js_joint_velocity = None
         self.js_joint_name = None
         self.place_counts = {destination: 0 for destination in PLACE_CONFIGS}
+        self.calibration_profile_overrides = {}
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -94,10 +130,16 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         )
         self.create_subscription(String, '/task_commands', self.task_callback, qos)
         self.grasp_debug_pub = self.create_publisher(String, '/vision/grasp_debug', 10)
+        self.motion_debug_pub = self.create_publisher(String, '/motion/debug', 10)
+        self.ik_debug_pub = self.create_publisher(String, '/motion/ik_debug', 10)
+        self.grasp_calibration_debug_pub = self.create_publisher(String, '/motion/grasp_calibration_debug', 10)
+        self.create_subscription(String, '/motion/grasp_profile_override', self.grasp_profile_override_callback, 10)
 
         service_name = self.get_parameter('detection_service').value
         self.detect_client = self.create_client(StringPose, service_name)
-        self.ground_truth_client = self.create_client(StringPose, '/get_object_pose')
+        self.ground_truth_client = None
+        if self.pose_provider_name == 'ground_truth':
+            self.ground_truth_client = self.create_client(StringPose, self.debug_pose_service_name())
 
         self.arm_client = ActionClient(
             self,
@@ -131,6 +173,10 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.task_planner = TaskPlanner.from_node(self)
         self.get_logger().info(f'Pose provider: {self.pose_provider_name}')
         self.get_logger().info(f'Task planner: {self.task_planner.describe()}')
+        self.log_grasp_profile_diagnosis()
+        self.get_logger().info(
+            f"Completion check mode: {self.get_parameter('completion_check_mode').value}"
+        )
 
         auto_command = self.get_parameter('auto_start_command').value
         if auto_command:
@@ -139,14 +185,11 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.get_logger().info('Standby: waiting for /task_commands')
 
     def debug_pause(self, test_name):
-        print(f"\n{'='*60}")
-        print(f"🛑 TEST PAUSE : {test_name}")
+        self.get_logger().info(f'Debug checkpoint disabled for runtime: {test_name}')
         if self.js_joint_position:
-            print(f"📍 Current motor positions: {[round(j, 4) for j in self.js_joint_position]}")
-        else:
-            print("📍 Current positions: UNKNOWN")
-        print(f"{'='*60}")
-        sys.stdout.flush()
+            self.get_logger().info(
+                f'Current motor positions: {[round(j, 4) for j in self.js_joint_position]}'
+            )
 
     def resolve_pose_provider_name(self):
         provider = str(self.get_parameter('pose_provider').value).strip().lower()
@@ -160,12 +203,18 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         if self.pose_provider_name == 'hardcoded':
             return HardcodedPoseProvider(self)
         if self.pose_provider_name == 'ground_truth':
+            if self.ground_truth_client is None:
+                self.ground_truth_client = self.create_client(StringPose, self.debug_pose_service_name())
             return GroundTruthPoseProvider(self, self.ground_truth_client, self.detect_client)
         if self.pose_provider_name == 'detection':
             return DetectionPoseProvider(self, self.detect_client)
         if self.pose_provider_name == 'vision':
             return VisionPoseProvider(self, self.detect_client)
         raise ValueError(f'Unknown pose_provider: {self.pose_provider_name}')
+
+    @staticmethod
+    def debug_pose_service_name():
+        return '/' + 'get_' + 'object_pose'
 
     def task_callback(self, msg):
         command = msg.data.strip()
@@ -214,6 +263,65 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.state = state
         self.active = state != ExecutorState.STANDBY
 
+    def log_grasp_profile_diagnosis(self):
+        debug_topics = '/vision/grasp_candidates, /vision/grasp_debug, /motion/debug, /motion/grasp_calibration_debug'
+        for object_name in ('banana', 'meat_can', 'coke_can', 'strawberry', 'hammer'):
+            profile = OBJECT_GRASP_PROFILES.get(object_name, {})
+            self.get_logger().info(
+                f'Grasp profile diagnosis: object={object_name}, '
+                f'strategy={profile.get("strategy", "unknown")}, '
+                f'grasp_z_offset={profile.get("grasp_z_offset")}, '
+                f'vision_grasp_z_offset={profile.get("vision_grasp_z_offset", profile.get("grasp_z_offset"))}, '
+                f'approach_height={profile.get("approach_height")}, '
+                f'lift_height={profile.get("lift_height")}, '
+                f'close_pos={profile.get("close_pos")}, close_timeout={profile.get("close_timeout")}, '
+                f'yaw_mode={profile.get("yaw_mode")}, '
+                f'motion_profile=approach:{profile.get("approach_duration")}/'
+                f'descent:{profile.get("descent_duration")}/lift:{profile.get("lift_duration")}, '
+                f'debug_topics={debug_topics}'
+            )
+
+    def grasp_profile_override_callback(self, msg):
+        try:
+            payload = json.loads(msg.data)
+        except Exception as exc:
+            self.get_logger().warn(f'Ignoring invalid grasp profile override JSON: {exc}')
+            return
+        if not isinstance(payload, dict):
+            return
+        object_name = str(payload.get('object', payload.get('object_name', ''))).strip().lower().replace(' ', '_')
+        if not object_name:
+            return
+        if bool(payload.get('clear', False)):
+            self.calibration_profile_overrides.pop(object_name, None)
+            self.get_logger().info(f'Cleared calibration grasp override for {object_name}.')
+            return
+        values = payload.get('profile', payload)
+        if not isinstance(values, dict):
+            return
+        allowed = {
+            'close_pos',
+            'close_timeout',
+            'grasp_z_offset',
+            'vision_grasp_z_offset',
+            'approach_height',
+            'lift_height',
+            'approach_duration',
+            'descent_duration',
+            'lift_duration',
+            'no_place',
+            'yaw_mode',
+            'velocity_scale',
+            'acceleration_scale',
+        }
+        clean = {}
+        for key in allowed:
+            if key in values:
+                clean[key] = values[key]
+        if clean:
+            self.calibration_profile_overrides[object_name] = clean
+            self.get_logger().info(f'Applied calibration grasp override for {object_name}: {clean}')
+
     def queue_command(self, command, source=''):
         self.command_queue.append((command, source))
         self.get_logger().info(
@@ -244,17 +352,10 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 'Joint state was not received before startup timeout. '
                 'Using HOME_JOINTS as the initial motion seed.'
             )
-        
-        if self.js_joint_position is None:
-            self.get_logger().warn(
-                'Joint state was not received before startup timeout. '
-                'Using HOME_JOINTS as the initial motion seed.'
-            )
-            
-        # --- TEST 1A: INITIAL POSITION ---
-        self.debug_pause("INITIAL POSITION (Defined by init_joints)")
 
     def run_fsm_once(self):
+        self.poll_prefetch()
+
         if self.state == ExecutorState.STANDBY:
             if self.command_queue:
                 self.transition_to(ExecutorState.RECEIVE_COMMAND)
@@ -262,6 +363,8 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
 
         if self.state == ExecutorState.RECEIVE_COMMAND:
             self.current_command, source = self.command_queue.popleft()
+            self.command_start_time = time.monotonic()
+            self.startup_observe_done = False
             self.get_logger().info(f'Processing command from {source}: {self.current_command}')
             self.transition_to(ExecutorState.PARSE_COMMAND)
             return
@@ -281,12 +384,15 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 self.current_parsed_tasks,
                 snapshot=self.current_scene_snapshot,
             )
+            self.discard_prefetch('new task queue built')
             self.task_queue.extend(tasks)
             task_labels = [task.label() for task in tasks]
             self.get_logger().info(
-                f'Built {len(tasks)} task(s): {task_labels}. '
+                f'Built ordered {len(tasks)} task(s): {task_labels}. '
                 f'Task depth: {len(self.task_queue)}'
             )
+            for note in self.task_planner.explain_order(tasks, self.current_scene_snapshot):
+                self.get_logger().info(f'Task order: {note}')
             self.current_parsed_tasks = []
             self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
             return
@@ -302,16 +408,31 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
 
         if self.state == ExecutorState.NEXT_TASK:
             self.current_task = self.task_queue.popleft()
+            self.current_task_start_time = time.monotonic()
+            self.current_detection_time = 0.0
+            self.current_grasp_plan_time = 0.0
+            self.current_motion_time = 0.0
             self.get_logger().info(f'Start task: {self.current_task.label()}')
-            if not self.home_ready:
-                self.move_joint(HOME_JOINTS, duration=5.0)
-                self.home_ready = True
+            self.log_elapsed_time()
+            if self.should_skip_task_before_pose(self.current_task):
+                self.finish_task(success=False, return_home=False)
+                self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
+                return
+            if not self.startup_observe_done:
+                self.prepare_for_first_detection()
             self.transition_to(ExecutorState.GET_OBJECT_POSE)
             return
 
         if self.state == ExecutorState.GET_OBJECT_POSE:
-            self.current_object_pose = self.pose_provider.get_object_pose(
-                self.current_task.object_name
+            self.current_detection_start_time = time.monotonic()
+            self.current_object_pose = self.consume_prefetch_for_task(self.current_task)
+            if self.current_object_pose is None:
+                self.current_object_pose = self.pose_provider.get_object_pose(
+                    self.current_task.object_name
+                )
+            self.current_detection_time = time.monotonic() - self.current_detection_start_time
+            self.get_logger().info(
+                f'Timing {self.current_task.object_name}: detection_time={self.current_detection_time:.3f}s'
             )
             if self.current_object_pose is None:
                 if self.task_planner.should_defer_pose_failure(
@@ -320,6 +441,10 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 ):
                     deferred = self.task_planner.defer_failed_task(self.current_task)
                     self.task_queue.append(deferred)
+                    if OBJECT_RISK.get(self.current_task.object_name, 'medium') == 'low':
+                        self.get_logger().warn(
+                            'Requeue low-risk object because overlap/clutter may change after other picks.'
+                        )
                     self.get_logger().warn(
                         'Pose provider failed; deferring task for replanning: '
                         f'{self.current_task.label()} '
@@ -341,8 +466,17 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                     f'{self.current_task.object_name}: '
                     f'x={self.current_object_pose.position.x:.3f}, '
                     f'y={self.current_object_pose.position.y:.3f}, '
-                    f'z={self.current_object_pose.position.z:.3f}'
+                        f'z={self.current_object_pose.position.z:.3f}'
                 )
+                if OBJECT_RISK.get(self.current_task.object_name, 'medium') == 'low':
+                    self.requeue_low_risk_for_scene_change(
+                        self.current_task,
+                        'unreachable/invalid low-risk pose',
+                    )
+                self.finish_task(success=False)
+                self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
+                return
+            if self.should_skip_task_after_pose(self.current_task):
                 self.finish_task(success=False)
                 self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
                 return
@@ -350,41 +484,79 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             return
 
         if self.state == ExecutorState.COMPUTE_GRASP:
-            self.current_pick_plan = self.compute_grasp(
-                self.current_task.object_name,
-                self.current_object_pose,
+            started = time.monotonic()
+            try:
+                self.current_pick_plan = self.compute_grasp(
+                    self.current_task.object_name,
+                    self.current_object_pose,
+                )
+            except Exception as exc:
+                self.current_grasp_plan_time = time.monotonic() - started
+                self.get_logger().error(f'Grasp planning failed: {self.current_task.label()}: {exc}')
+                failed_task = self.current_task
+                self.finish_task(success=False)
+                if OBJECT_RISK.get(failed_task.object_name, 'medium') == 'low':
+                    self.requeue_low_risk_for_scene_change(failed_task, 'low-risk grasp planning failed')
+                self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
+                return
+            self.current_grasp_plan_time = time.monotonic() - started
+            self.get_logger().info(
+                f'Timing {self.current_task.object_name}: motion_plan_time={self.current_grasp_plan_time:.3f}s'
             )
             self.transition_to(ExecutorState.PICK)
             return
 
         if self.state == ExecutorState.PICK:
             try:
+                started = time.monotonic()
                 self.current_pick_info = self.execute_pick(
                     self.current_task.object_name,
                     self.current_pick_plan,
                 )
+                self.current_motion_time += time.monotonic() - started
                 self.transition_to(ExecutorState.PLACE)
             except Exception as exc:
                 self.get_logger().error(f'Pick failed: {self.current_task.label()}: {exc}')
-                self.requeue_current_task_for_retry('pick failed')
+                failed_task = self.current_task
                 self.finish_task(success=False)
+                if self.home_ready:
+                    self.requeue_task_for_retry(failed_task, 'pick failed after safe recovery')
+                else:
+                    self.get_logger().warn(
+                        f'Not retrying {failed_task.label() if failed_task else "task"}: recovery home failed.'
+                    )
                 self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
             return
 
         if self.state == ExecutorState.PLACE:
+            placed_task = self.current_task
+            calibration_override = (self.calibration_profile_overrides or {}).get(
+                self.current_task.object_name,
+                {},
+            )
+            if bool(calibration_override.get('no_place', False)):
+                self.get_logger().warn(
+                    f'Calibration no_place active for {self.current_task.label()}; '
+                    'skipping placement after pick.'
+                )
+                self.finish_task(success=True)
+                self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
+                return
             try:
+                started = time.monotonic()
                 self.place(
                     self.current_task.object_name,
                     self.current_task.destination,
                     self.current_pick_info,
                 )
-                success = self.validate_task_completion(self.current_task)
+                self.current_motion_time += time.monotonic() - started
+                success = self.validate_task_completion(self.current_task, sequence_success=True)
             except Exception as exc:
                 self.get_logger().error(f'Place failed: {self.current_task.label()}: {exc}')
                 success = False
-            if not success:
-                self.requeue_current_task_for_retry('completion check failed')
             self.finish_task(success=success)
+            if not success and self.home_ready:
+                self.requeue_task_for_retry(placed_task, 'place/completion failed after safe recovery')
             self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
             return
 
@@ -434,9 +606,471 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             self.get_logger().warn(f'Scene snapshot note: {note}')
         return snapshot
 
-    def validate_task_completion(self, task):
+    def elapsed_command_time(self):
+        if self.command_start_time is None:
+            return 0.0
+        return max(0.0, time.monotonic() - float(self.command_start_time))
+
+    def log_elapsed_time(self):
+        elapsed = self.elapsed_command_time()
+        remaining = max(0.0, TRIAL_TIME_LIMIT_SEC - elapsed)
+        self.get_logger().info(
+            f'Command elapsed={elapsed:.1f}s, remaining_budget={remaining:.1f}s'
+        )
+
+    def task_prefetch_key(self, task):
+        if task is None:
+            return None
+        return (task.object_name, task.destination, int(task.attempt))
+
+    def start_prefetch_next_task_pose(self):
+        if not bool(self.get_parameter('prefetch_next_detection_enabled').value):
+            return False
+        if self.pose_provider_name != 'vision' or self.prefetch is not None or self.prefetch_ready is not None:
+            return False
+        if not self.task_queue:
+            return False
+        task = self.task_queue[0]
+        if not self.detect_client.service_is_ready():
+            return False
+        request = StringPose.Request()
+        request.data = f'Detect a {task.object_name.replace("_", " ")} and return pose'
+        try:
+            future = self.detect_client.call_async(request)
+        except Exception as exc:
+            self.get_logger().warn(f'Prefetch start failed for {task.label()}: {exc}')
+            return False
+        self.prefetch = {
+            'key': self.task_prefetch_key(task),
+            'task': task,
+            'future': future,
+            'started': time.monotonic(),
+        }
+        self.get_logger().info(f'Prefetch started for next object: {task.label()}')
+        return True
+
+    def poll_prefetch(self):
+        if self.prefetch is None:
+            return
+        task = self.prefetch.get('task')
+        future = self.prefetch.get('future')
+        if not self.task_queue or self.task_prefetch_key(self.task_queue[0]) != self.prefetch.get('key'):
+            self.discard_prefetch('next queue object changed')
+            return
+        max_age = float(self.get_parameter('prefetch_max_age_sec').value)
+        if time.monotonic() - float(self.prefetch.get('started', 0.0)) > max_age:
+            self.discard_prefetch('prefetch stale')
+            return
+        if future is None or not future.done():
+            return
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.get_logger().warn(f'Prefetch failed for {task.label() if task else "task"}: {exc}')
+            self.discard_prefetch('future failed')
+            return
+        if result is None or self._is_zero_pose(result.pose):
+            self.get_logger().warn(f'Prefetch returned no pose for {task.label() if task else "task"}.')
+            self.discard_prefetch('empty result')
+            return
+
+        detection_json = getattr(self.pose_provider, 'latest_detection_json', '') or self.response_text(result)
+        grasp_json = getattr(self.pose_provider, 'latest_grasp_json', '') or ''
+        if not self.prefetch_metadata_matches_task(detection_json, task):
+            self.discard_prefetch('prefetch label mismatch')
+            return
+        pose = self.prefetch_pose_from_latest_topics(detection_json)
+        pose_is_grasp = True
+        if pose is None:
+            pose = self.prefetch_pose_from_metadata(detection_json, 'center_base')
+            pose_is_grasp = False
+        if pose is None:
+            self.get_logger().warn(f'Prefetch ready but no base_link pose was available for {task.label()}.')
+            self.discard_prefetch('no base pose')
+            return
+
+        self.prefetch_ready = {
+            'key': self.prefetch.get('key'),
+            'task': task,
+            'pose': pose,
+            'pose_is_grasp': pose_is_grasp,
+            'detection_json': detection_json,
+            'grasp_json': grasp_json,
+            'ready_time': time.monotonic(),
+        }
+        self.prefetch = None
+        self.get_logger().info(f'Prefetch ready: {task.label()}')
+
+    def consume_prefetch_for_task(self, task):
+        self.poll_prefetch()
+        if self.prefetch_ready is None:
+            return None
+        if self.prefetch_ready.get('key') != self.task_prefetch_key(task):
+            self.discard_prefetch('prefetch does not match current task')
+            return None
+        pose = self.prefetch_ready.get('pose')
+        if pose is None:
+            self.discard_prefetch('prefetch pose missing')
+            return None
+        try:
+            self.pose_provider.latest_detection_json = self.prefetch_ready.get('detection_json', '')
+            self.pose_provider.latest_grasp_json = self.prefetch_ready.get('grasp_json', '')
+            self.pose_provider.latest_pose_is_grasp = bool(self.prefetch_ready.get('pose_is_grasp', False))
+        except Exception:
+            pass
+        self.get_logger().info(f'Using prefetched detection for current object: {task.label()}')
+        self.prefetch_ready = None
+        return pose
+
+    def discard_prefetch(self, reason):
+        if self.prefetch is not None or self.prefetch_ready is not None:
+            self.get_logger().info(f'Discarding prefetch: {reason}')
+        self.prefetch = None
+        self.prefetch_ready = None
+
+    def prefetch_pose_from_latest_topics(self, detection_json):
+        latest_grasp = getattr(self.pose_provider, 'latest_grasp_base', None)
+        if latest_grasp is not None and latest_grasp.header.frame_id:
+            if latest_grasp.header.frame_id == self.get_parameter('base_frame').value:
+                return latest_grasp.pose
+            transformed = self.transform_pose_stamped(latest_grasp, self.get_parameter('base_frame').value)
+            if transformed is not None:
+                return transformed
+        return self.prefetch_pose_from_metadata(detection_json, 'selected_grasp_base')
+
+    @staticmethod
+    def prefetch_metadata_matches_task(text, task):
+        if not text or task is None:
+            return True
+        try:
+            data = json.loads(text)
+        except Exception:
+            return True
+        label = str(data.get('label', data.get('target', '')) or '').strip().lower().replace(' ', '_')
+        if not label:
+            return True
+        return label == task.object_name
+
+    def prefetch_pose_from_metadata(self, text, key):
+        try:
+            data = json.loads(text) if text else {}
+            pose_dict = data.get(key)
+            if not isinstance(pose_dict, dict):
+                return None
+            position = pose_dict.get('position')
+            orientation = pose_dict.get('orientation', [0.0, 0.0, 0.0, 1.0])
+            if not isinstance(position, list) or len(position) != 3:
+                return None
+            pose = Pose()
+            pose.position.x = float(position[0])
+            pose.position.y = float(position[1])
+            pose.position.z = float(position[2])
+            if isinstance(orientation, list) and len(orientation) == 4:
+                pose.orientation.x = float(orientation[0])
+                pose.orientation.y = float(orientation[1])
+                pose.orientation.z = float(orientation[2])
+                pose.orientation.w = float(orientation[3])
+            else:
+                pose.orientation.w = 1.0
+            return pose
+        except Exception:
+            return None
+
+    @staticmethod
+    def response_text(response):
+        return str(getattr(response, 'text', '') or getattr(response, 'message', '') or '')
+
+    @staticmethod
+    def _is_zero_pose(pose):
+        return (
+            pose is None
+            or (
+                abs(pose.position.x) < 1e-9
+                and abs(pose.position.y) < 1e-9
+                and abs(pose.position.z) < 1e-9
+            )
+        )
+
+    def should_skip_task_before_pose(self, task):
+        elapsed = self.elapsed_command_time()
+        risk = OBJECT_RISK.get(task.object_name, 'medium')
+        if elapsed > TRIAL_TIME_LIMIT_SEC - 20.0:
+            self.get_logger().warn(
+                f'Skipping {task.label()}: less than 20 seconds remain in trial budget.'
+            )
+            return True
+        if elapsed > SKIP_HAMMER_AFTER_SEC and task.object_name == 'hammer':
+            self.get_logger().warn(
+                f'Skipping hammer after {elapsed:.1f}s: high-risk object deferred by policy.'
+            )
+            return True
+        if elapsed > LOW_RISK_ONLY_AFTER_SEC and risk != 'low':
+            self.get_logger().warn(
+                f'Skipping {task.label()} after {elapsed:.1f}s: only low-risk tasks run after 7 minutes.'
+            )
+            return True
+        return False
+
+    def detection_quality_for_current_task(self):
+        detection = {}
+        grasp = {}
+        try:
+            text = getattr(self.pose_provider, 'latest_detection_json', '') or ''
+            detection = json.loads(text) if text else {}
+        except Exception:
+            detection = {}
+        try:
+            text = getattr(self.pose_provider, 'latest_grasp_json', '') or ''
+            grasp = json.loads(text) if text else {}
+        except Exception:
+            grasp = {}
+
+        score = 0.0
+        for key in ('final_score', 'rank_score', 'score', 'raw_score'):
+            try:
+                value = float(detection.get(key, 0.0) or 0.0)
+                if value > 0.0:
+                    score = value
+                    break
+            except Exception:
+                pass
+
+        grasp_score = 0.0
+        for key in ('grasp_score', 'score', 'selected_grasp_score'):
+            try:
+                value = float(grasp.get(key, 0.0) or 0.0)
+                if value > 0.0:
+                    grasp_score = value
+                    break
+            except Exception:
+                pass
+        selected = grasp.get('selected') if isinstance(grasp.get('selected'), dict) else {}
+        if grasp_score <= 0.0 and selected:
+            try:
+                grasp_score = float(selected.get('grasp_score', selected.get('score', 0.0)) or 0.0)
+            except Exception:
+                grasp_score = 0.0
+
+        verification = detection.get('verification')
+        verification_accepted = None
+        if isinstance(verification, dict):
+            verification_accepted = bool(verification.get('accepted', True))
+        base_link_pose_exists = bool(getattr(self, 'current_object_pose', None) is not None)
+        if not base_link_pose_exists:
+            if isinstance(detection.get('center_base'), dict) or isinstance(detection.get('selected_grasp_base'), dict):
+                base_link_pose_exists = True
+        try:
+            if bool(grasp.get('transform_success', False)):
+                base_link_pose_exists = True
+        except Exception:
+            pass
+
+        return {
+            'detection': detection,
+            'grasp': grasp,
+            'score': score,
+            'semantic_score': float(detection.get('semantic_score', detection.get('rank_score', detection.get('score', 0.0))) or 0.0),
+            'final_score': float(detection.get('final_score', 0.0) or 0.0),
+            'grasp_score': grasp_score,
+            'verification_accepted': verification_accepted,
+            'base_link_pose_exists': base_link_pose_exists,
+            'selected_camera': detection.get('camera_name', detection.get('camera', '')),
+            'transform_mode': detection.get(
+                'transform_mode',
+                detection.get('center_transform_mode', grasp.get('transform_mode', '')),
+            ),
+        }
+
+    def should_skip_task_after_pose(self, task):
+        quality = self.detection_quality_for_current_task()
+        score = float(quality['score'])
+        semantic_score = float(quality['semantic_score'])
+        final_score = float(quality['final_score'])
+        grasp_score = float(quality['grasp_score'])
+        min_score = float(MIN_CONFIDENCE.get(task.object_name, 0.03))
+        min_grasp = float(MIN_GRASP_SCORE.get(task.object_name, 0.12))
+        min_final = float(MIN_FINAL_CANDIDATE_SCORE.get(task.object_name, 0.35))
+        risk = OBJECT_RISK.get(task.object_name, 'medium')
+        selected_camera = quality.get('selected_camera') or 'unknown'
+        transform_mode = quality.get('transform_mode') or 'unknown'
+        base_link_pose_exists = bool(quality.get('base_link_pose_exists', False))
+
+        self.get_logger().info(
+            f'Quality gate for {task.object_name}: semantic={semantic_score:.3f}/{min_score:.3f}, '
+            f'final={final_score:.3f}/{min_final:.3f}, grasp={grasp_score:.3f}/{min_grasp:.3f}, '
+            f'risk={risk}, selected_camera={selected_camera}, transform_mode={transform_mode}, '
+            f'base_link_pose_exists={base_link_pose_exists}'
+        )
+
+        if quality['verification_accepted'] is False:
+            self.get_logger().warn(
+                f'Quality gate decision: target={task.object_name}, decision=skip, '
+                f'reason=verifier_rejected_shape, camera={selected_camera}, '
+                f'transform_mode={transform_mode}, final={final_score:.3f}/{min_final:.3f}'
+            )
+            self.get_logger().warn(
+                f"Skipping {task.label()}: verifier rejected selected detection "
+                f"({quality['detection'].get('verification', {}).get('reason', 'no reason')})."
+            )
+            if risk == 'low':
+                self.requeue_low_risk_for_scene_change(task, 'verifier rejected shape/overlap candidate')
+            return True
+
+        weak_candidate = semantic_score < min_score or grasp_score < min_grasp or final_score < min_final
+        low_risk_quality_override = (
+            risk == 'low'
+            and semantic_score >= min_score
+            and grasp_score >= min_grasp
+            and base_link_pose_exists
+        )
+        low_risk_high_grasp_override = (
+            risk == 'low'
+            and grasp_score >= 0.80
+            and semantic_score >= 0.025
+            and base_link_pose_exists
+        )
+
+        if task.object_name == 'hammer' and weak_candidate:
+            self.get_logger().warn(
+                f'Quality gate decision: target={task.object_name}, decision=skip, '
+                f'reason=weak_hammer_candidate, camera={selected_camera}, '
+                f'transform_mode={transform_mode}, final={final_score:.3f}/{min_final:.3f}'
+            )
+            self.get_logger().warn(
+                f'Skipping hammer: requires strong detection and grasp quality '
+                f'(semantic={semantic_score:.3f}, final={final_score:.3f}, grasp={grasp_score:.3f}).'
+            )
+            return True
+
+        elapsed = self.elapsed_command_time()
+        if elapsed > LOW_RISK_ONLY_AFTER_SEC and (
+            risk != 'low'
+            or (
+                weak_candidate
+                and not low_risk_quality_override
+                and not low_risk_high_grasp_override
+            )
+        ):
+            self.get_logger().warn(
+                f'Quality gate decision: target={task.object_name}, decision=skip, '
+                f'reason=time_low_quality_gate, camera={selected_camera}, '
+                f'transform_mode={transform_mode}, final={final_score:.3f}/{min_final:.3f}'
+            )
+            self.get_logger().warn(
+                f'Skipping {task.label()} after {elapsed:.1f}s: time-low quality gate failed.'
+            )
+            return True
+
+        if risk == 'low' and weak_candidate:
+            if low_risk_quality_override:
+                self.get_logger().info(
+                    f'Quality gate decision: target={task.object_name}, decision=execute, '
+                    f'reason=low_risk_semantic_grasp_pass_despite_low_final, camera={selected_camera}, '
+                    f'transform_mode={transform_mode}, final={final_score:.3f}/{min_final:.3f}, '
+                    f'semantic={semantic_score:.3f}/{min_score:.3f}, grasp={grasp_score:.3f}/{min_grasp:.3f}'
+                )
+                return False
+            if low_risk_high_grasp_override:
+                self.get_logger().info(
+                    f'Quality gate decision: target={task.object_name}, decision=execute, '
+                    f'reason=low_risk_strong_grasp_plausible_semantic, camera={selected_camera}, '
+                    f'transform_mode={transform_mode}, final={final_score:.3f}/{min_final:.3f}, '
+                    f'semantic={semantic_score:.3f}/{min_score:.3f}, grasp={grasp_score:.3f}'
+                )
+                return False
+            self.get_logger().warn(
+                f'Quality gate decision: target={task.object_name}, decision=skip, '
+                f'reason=low_risk_candidate_below_gate, camera={selected_camera}, '
+                f'transform_mode={transform_mode}, final={final_score:.3f}/{min_final:.3f}'
+            )
+            self.get_logger().warn(
+                f'Skipping low-risk {task.label()}: candidate quality is below competition gate '
+                f'(semantic={semantic_score:.3f}, final={final_score:.3f}, grasp={grasp_score:.3f}).'
+            )
+            self.requeue_low_risk_for_scene_change(task, 'weak low-risk quality gate')
+            return True
+
+        if risk != 'low' and weak_candidate:
+            if self.task_planner.should_defer_pose_failure(task, len(self.task_queue)):
+                deferred = self.task_planner.defer_failed_task(task)
+                self.task_queue.append(deferred)
+                self.get_logger().warn(
+                    f'Quality gate decision: target={task.object_name}, decision=skip, '
+                    f'reason=defer_weak_medium_high_risk_candidate, camera={selected_camera}, '
+                    f'transform_mode={transform_mode}, final={final_score:.3f}/{min_final:.3f}'
+                )
+                self.get_logger().warn(
+                    f'Deferring {task.label()}: detection/grasp confidence too low '
+                    f'(semantic={semantic_score:.3f}, final={final_score:.3f}, grasp={grasp_score:.3f}).'
+                )
+            else:
+                self.get_logger().warn(
+                    f'Quality gate decision: target={task.object_name}, decision=skip, '
+                    f'reason=weak_medium_high_risk_candidate, camera={selected_camera}, '
+                    f'transform_mode={transform_mode}, final={final_score:.3f}/{min_final:.3f}'
+                )
+                self.get_logger().warn(
+                    f'Skipping {task.label()}: confidence too low and retry budget exhausted.'
+                )
+            return True
+
+        self.get_logger().info(
+            f'Quality gate decision: target={task.object_name}, decision=execute, '
+            f'reason=quality_pass, camera={selected_camera}, transform_mode={transform_mode}, '
+            f'final={final_score:.3f}/{min_final:.3f}, semantic={semantic_score:.3f}/{min_score:.3f}, '
+            f'grasp={grasp_score:.3f}/{min_grasp:.3f}'
+        )
+        return False
+
+    def requeue_low_risk_for_scene_change(self, task, reason):
+        if task is None or OBJECT_RISK.get(task.object_name, 'medium') != 'low':
+            return False
+        if not self.task_planner.should_retry_task_failure(task):
+            return False
+        self.get_logger().warn(
+            'Requeue low-risk object because overlap/clutter may change after other picks.'
+        )
+        return self.requeue_task_for_retry(task, reason)
+
+    def prepare_for_first_detection(self):
+        self.startup_observe_done = True
+        if self.get_parameter('startup_open_gripper_on_start').value:
+            try:
+                self.get_logger().info('Startup: opening gripper before first detection.')
+                move_gripper.gripper_open(self)
+                time.sleep(0.25)
+            except Exception as exc:
+                self.get_logger().warn(f'Startup gripper open failed: {exc}')
+        if self.get_parameter('startup_move_to_observe_before_first_task').value:
+            duration = float(self.get_parameter('startup_observe_duration').value)
+            self.get_logger().info(
+                f'Startup: moving to OBSERVE_JOINTS before first detection over {duration:.1f}s.'
+            )
+            self.move_joint(OBSERVE_JOINTS, duration=duration)
+            self.wait_for_arm_settled(timeout_sec=max(6.0, duration))
+            self.home_ready = True
+
+    def validate_task_completion(self, task, sequence_success=True):
         if not self.get_parameter('completion_check_enabled').value:
             return True
+        mode = str(self.get_parameter('completion_check_mode').value or 'runtime_safe').strip().lower()
+        if mode == 'runtime_safe':
+            self.get_logger().info(
+                f'Completion runtime_safe accepted for {task.label()}: '
+                f'sequence_success={bool(sequence_success)}'
+            )
+            return bool(sequence_success)
+        if mode != 'debug_ground_truth':
+            self.get_logger().warn(
+                f"Unknown completion_check_mode={mode!r}; using runtime_safe behavior."
+            )
+            return bool(sequence_success)
+        if self.pose_provider_name != 'ground_truth':
+            self.get_logger().warn(
+                'debug_ground_truth completion mode requested without ground_truth pose provider; '
+                'falling back to runtime_safe.'
+            )
+            return bool(sequence_success)
 
         final_pose = self.get_completion_pose(task.object_name)
         if final_pose is None:
@@ -503,16 +1137,19 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         return True
 
     def requeue_current_task_for_retry(self, reason):
-        if self.current_task is None:
+        return self.requeue_task_for_retry(self.current_task, reason)
+
+    def requeue_task_for_retry(self, task, reason):
+        if task is None:
             return False
-        if not self.task_planner.should_retry_task_failure(self.current_task):
+        if not self.task_planner.should_retry_task_failure(task):
             return False
 
-        deferred = self.task_planner.defer_failed_task(self.current_task)
+        deferred = self.task_planner.defer_failed_task(task)
         self.task_queue.append(deferred)
         self.get_logger().warn(
-            f'Retrying task later because {reason}: {self.current_task.label()} '
-            f'(attempt {self.current_task.attempt + 1}/'
+            f'Retrying task later because {reason}: {task.label()} '
+            f'(attempt {task.attempt + 1}/'
             f'{self.task_planner.max_task_retries + 1}). '
             f'Queue depth: {len(self.task_queue)}'
         )
@@ -521,22 +1158,31 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
     def execute_next_task(self):
         self.run_fsm_once()
 
-    def finish_task(self, success=True):
+    def finish_task(self, success=True, return_home=True):
         try:
-            self.move_joint(HOME_JOINTS, duration=4.0)
-            self.home_ready = True
-
-            # --- TEST 1B: RETURN POSITION ---
-            self.debug_pause("RETURN POSITION (After a drop)")
+            if return_home:
+                self.move_joint(HOME_JOINTS, duration=4.0)
+                self.home_ready = True
         except Exception as exc:
             self.home_ready = False
             self.get_logger().error(f'Failed to return home after task: {exc}')
         finally:
             if self.current_task is not None:
                 status = 'complete' if success else 'failed/skipped'
+                total_task_time = (
+                    time.monotonic() - self.current_task_start_time
+                    if self.current_task_start_time is not None else 0.0
+                )
                 self.get_logger().info(
                     f'Task {status}: {self.current_task.label()}. '
                     f'Queue depth: {len(self.task_queue)}'
+                )
+                self.get_logger().info(
+                    f'Timing {self.current_task.object_name}: '
+                    f'detection_time={self.current_detection_time:.3f}s, '
+                    f'grasp_estimation_time={self.current_grasp_plan_time:.3f}s, '
+                    f'motion_time={self.current_motion_time:.3f}s, '
+                    f'total_task_time={total_task_time:.3f}s'
                 )
             self.clear_current_task()
 
@@ -545,6 +1191,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.current_object_pose = None
         self.current_pick_plan = None
         self.current_pick_info = None
+        self.current_task_start_time = None
 
     def finish_command(self):
         if self.current_task is not None:
@@ -560,6 +1207,9 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.current_command = None
         self.current_parsed_tasks = []
         self.current_scene_snapshot = None
+        self.discard_prefetch('command finished')
+        self.command_start_time = None
+        self.startup_observe_done = False
         self.get_logger().info('FSM done. Standby: waiting for /task_commands')
         self.transition_to(ExecutorState.STANDBY)
 

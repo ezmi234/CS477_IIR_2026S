@@ -13,6 +13,82 @@ default:
   min_candidate_score: 0.12
   candidate_yaw_offsets: [0.0, 1.5708]
 
+object_grasp_profiles:
+  banana:
+    strategy: banana_mask_distance_transform
+    close_pos: 0.90
+    close_timeout: 3.5
+    approach_height: 0.16
+    grasp_z_offset: -0.010
+    vision_grasp_z_offset: -0.018
+    vision_grasp_z_min: -0.080
+    vision_grasp_z_max: -0.025
+    lift_height: 0.28
+    yaw_mode: local_tangent
+    risk: medium
+    approach_duration: 3.0
+    descent_duration: 2.4
+    lift_duration: 3.0
+    post_close_sleep: 0.35
+    use_vision_grasp_orientation: true
+
+  meat_can:
+    strategy: can_side_or_top_center
+    close_pos: 0.38
+    close_timeout: 2.5
+    approach_height: 0.12
+    grasp_z_offset: -0.010
+    lift_height: 0.18
+    yaw_mode: symmetric_default
+    risk: low
+    approach_duration: 2.3
+    descent_duration: 1.8
+    lift_duration: 2.2
+
+  coke_can:
+    strategy: can_side_or_top_center
+    close_pos: 0.42
+    close_timeout: 2.5
+    approach_height: 0.12
+    grasp_z_offset: -0.010
+    lift_height: 0.18
+    yaw_mode: symmetric_default
+    risk: low
+    approach_duration: 2.3
+    descent_duration: 1.8
+    lift_duration: 2.2
+
+  strawberry:
+    strategy: compact_top_center
+    close_pos: 0.70
+    close_timeout: 2.5
+    approach_height: 0.10
+    grasp_z_offset: -0.006
+    lift_height: 0.14
+    yaw_mode: symmetric_default
+    risk: low
+    approach_duration: 2.4
+    descent_duration: 1.8
+    lift_duration: 2.2
+
+  hammer:
+    strategy: handle_grasp
+    close_pos: 0.75
+    close_timeout: 3.0
+    approach_height: 0.16
+    grasp_z_offset: -0.012
+    vision_grasp_z_offset: 0.0
+    vision_grasp_z_min: -0.045
+    vision_grasp_z_max: 0.040
+    lift_height: 0.22
+    yaw_mode: handle_axis
+    risk: high
+    approach_duration: 3.2
+    descent_duration: 2.8
+    lift_duration: 3.2
+    post_close_sleep: 0.35
+    use_vision_grasp_orientation: true
+
 banana:
   strategy: banana_mask_distance_transform
   yellow_hsv_lower: [15, 40, 40]
@@ -37,25 +113,38 @@ hammer:
   max_handle_width: 0.065
   use_largest_cluster: false
   surface_depth_offset: 0.0
-  approach_height: 0.17
+  approach_height: 0.16
 
 coke_can:
-  strategy: center_top
+  strategy: can_side_or_top_center
   prefer_center_top: true
-  candidate_yaw_offsets: [0.0]
+  candidate_yaw_offsets: [0.0, 1.5708]
+  rim_guard_fraction: 0.22
+  upper_body_percentile: 18.0
+  max_gripper_width: 0.075
   surface_depth_offset: 0.0
   aliases: ["cola can", "red soda can", "red can"]
 
 meat_can:
-  strategy: center_top
+  strategy: can_side_or_top_center
   prefer_center_top: true
-  candidate_yaw_offsets: [0.0]
+  candidate_yaw_offsets: [0.0, 1.5708]
+  rim_guard_fraction: 0.22
+  upper_body_percentile: 18.0
+  max_gripper_width: 0.075
   surface_depth_offset: 0.0
   aliases: ["tin can", "food can", "canned food"]
 
 strawberry:
-  strategy: center_top
+  strategy: compact_top_center
   prefer_center_top: true
   candidate_yaw_offsets: [0.0]
   min_points: 25
+  max_expected_width: 0.075
+  max_expected_length: 0.085
+  can_like_min_height: 0.060
+  red_hsv_lower_1: [0, 45, 35]
+  red_hsv_upper_1: [12, 255, 255]
+  red_hsv_lower_2: [165, 45, 35]
+  red_hsv_upper_2: [180, 255, 255]
   surface_depth_offset: 0.0

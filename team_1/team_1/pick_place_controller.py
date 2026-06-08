@@ -1,9 +1,7 @@
 import copy
 import json
 import math
-import sys
 import time
-import numpy as np
 
 from geometry_msgs.msg import Pose
 from manip_challenge import move_gripper
@@ -14,6 +12,7 @@ from .config import (
     DEBUG_GROUND_TRUTH_Z_OFFSETS,
     GRIPPER_CLOSE_POSITIONS,
     HOME_JOINTS,
+    OBJECT_GRASP_PROFILES,
     OBJECT_PICK_OVERRIDES,
     PICK_APPROACH_HEIGHTS,
     PICK_LIFT_HEIGHTS,
@@ -21,20 +20,24 @@ from .config import (
     PLACE_CONFIGS,
     STORAGE_OBJECT_OVERRIDES,
 )
+from .grasp_orientation import yaw_candidates
 from .motion_math import calc_rot_time
 
 
 class PickPlaceMixin:
+    def object_grasp_profile(self, object_name):
+        profile = dict(OBJECT_GRASP_PROFILES.get(object_name, {}))
+        runtime = getattr(self, 'calibration_profile_overrides', {}) or {}
+        if object_name in runtime and isinstance(runtime[object_name], dict):
+            profile.update(runtime[object_name])
+        return profile
+
     def ground_truth_z_offset(self, object_name):
         default_offset = self.get_parameter('ground_truth_z_offset').value
         return DEBUG_GROUND_TRUTH_Z_OFFSETS.get(object_name, default_offset)
 
     def find_reachable_storage_slot(self, destination, config, override, pick_info):
-        """
-        Defines 3 safe slots strictly in the middle of the box (far from edges).
-        Tries empty slots first. If all are full or unreachable, tries them all again.
-        """
-        import numpy as np
+        """Choose a center-first, inner-margin storage slot."""
 
         # Initialize the memory for occupied slots if it doesn't exist yet
         if not hasattr(self, 'occupied_slots'):
@@ -55,16 +58,21 @@ class PickPlaceMixin:
         else:
             release_z = float(override.get('release_z', config['release_z']))
 
-        # 3. Create 3 perfectly centered slots (X is strictly middle, Y is spread)
-        # This keeps the arm far from the edges.
         x_mid = 0.5 * (x_start + x_end)
         y_mid = 0.5 * (y_start + y_end)
+        x_span = abs(x_end - x_start)
         y_span = abs(y_end - y_start)
+        margin_x = float(override.get('slot_margin_x', config.get('slot_margin_x', 0.22 * x_span)))
+        margin_y = float(override.get('slot_margin_y', config.get('slot_margin_y', 0.22 * y_span)))
+        x_offset = max(0.0, min(0.20 * x_span, 0.5 * x_span - margin_x))
+        y_offset = max(0.0, min(0.24 * y_span, 0.5 * y_span - margin_y))
 
         all_slots = [
-            (float(x_mid), float(y_mid)),                    # Exact center
-            (float(x_mid), float(y_mid - 0.25 * y_span)),    # Center-Top (25% margin from edge)
-            (float(x_mid), float(y_mid + 0.25 * y_span))     # Center-Bottom (25% margin from edge)
+            (float(x_mid), float(y_mid)),
+            (float(x_mid), float(y_mid - y_offset)),
+            (float(x_mid), float(y_mid + y_offset)),
+            (float(x_mid - x_offset), float(y_mid)),
+            (float(x_mid + x_offset), float(y_mid)),
         ]
 
         # 4. Filter out slots we have already used in this specific box
@@ -81,16 +89,23 @@ class PickPlaceMixin:
         # 5. FIRST PASS: Try to find a completely EMPTY slot
         for x, y in available_slots:
             if is_reachable(x, y):
-                self.get_logger().info(f"Valid EMPTY slot found at X:{x:.2f}, Y:{y:.2f}")
-                # Remember this slot!
+                self.get_logger().info(
+                    f"Storage slot selected for {destination}: x={x:.3f}, y={y:.3f}, "
+                    f"margin_x={margin_x:.3f}, margin_y={margin_y:.3f}, occupied={len(self.occupied_slots.get(destination, []))}"
+                )
                 self.occupied_slots.setdefault(destination, []).append((x, y)) 
                 return (x, y)
 
         # 6. SECOND PASS (Fallback): If all slots are full or unreachable, try them all again anyway
-        self.get_logger().warn(f"No empty slots for {destination} (or unreachable)! Forcing fallback to the 3 main spots.")
+        self.get_logger().warn(
+            f"No empty inner slots for {destination} (or unreachable). Trying occupied inner slots only."
+        )
         for x, y in all_slots:
             if is_reachable(x, y):
-                self.get_logger().info(f"Fallback slot found at X:{x:.2f}, Y:{y:.2f} (Already occupied, stacking)")
+                self.get_logger().info(
+                    f"Fallback storage slot for {destination}: x={x:.3f}, y={y:.3f}, "
+                    f"margin_x={margin_x:.3f}, margin_y={margin_y:.3f}"
+                )
                 return (x, y)
 
         return None
@@ -103,17 +118,44 @@ class PickPlaceMixin:
         )
 
     def compute_grasp(self, object_name, object_pose):
-        overrides = OBJECT_PICK_OVERRIDES.get(object_name, {})
+        profile = self.object_grasp_profile(object_name)
+        overrides = dict(OBJECT_PICK_OVERRIDES.get(object_name, {}))
+        for key in (
+            'approach_height',
+            'lift_height',
+            'grasp_z_offset',
+            'vision_grasp_z_offset',
+            'vision_grasp_z_min',
+            'vision_grasp_z_max',
+            'close_timeout',
+            'approach_duration',
+            'descent_duration',
+            'lift_duration',
+            'post_close_sleep',
+            'close_force',
+            'use_vision_grasp_orientation',
+            'yaw_mode',
+            'velocity_scale',
+            'acceleration_scale',
+        ):
+            if key in profile:
+                overrides[key] = profile[key]
         approach_height = float(
-            overrides.get(
+            profile.get(
                 'approach_height',
-                PICK_APPROACH_HEIGHTS.get(object_name, self.get_parameter('approach_height').value),
+                overrides.get(
+                    'approach_height',
+                    PICK_APPROACH_HEIGHTS.get(object_name, self.get_parameter('approach_height').value),
+                ),
             )
         )
         lift_height = float(
-            overrides.get(
+            profile.get(
                 'lift_height',
-                PICK_LIFT_HEIGHTS.get(object_name, self.get_parameter('lift_height').value),
+                overrides.get(
+                    'lift_height',
+                    PICK_LIFT_HEIGHTS.get(object_name, self.get_parameter('lift_height').value),
+                ),
             )
         )
         pose_is_grasp = bool(getattr(self.pose_provider, 'latest_pose_is_grasp', False))
@@ -140,49 +182,152 @@ class PickPlaceMixin:
             target_y,
             target_z + approach_height,
         )
+        approach_low = copy.deepcopy(approach)
+        approach_low.position.z = target_z + max(0.045, approach_height * 0.45)
         grasp = copy.deepcopy(approach)
         if pose_is_grasp:
-            grasp_z_offset = float(overrides.get('vision_grasp_z_offset', self.get_parameter('grasp_z_offset').value))
+            grasp_z_offset = float(
+                profile.get(
+                    'vision_grasp_z_offset',
+                    profile.get(
+                        'grasp_z_offset',
+                        overrides.get('vision_grasp_z_offset', self.get_parameter('grasp_z_offset').value),
+                    ),
+                )
+            )
         else:
-            grasp_z_offset = float(overrides.get('grasp_z_offset', self.get_parameter('grasp_z_offset').value))
+            grasp_z_offset = float(
+                profile.get(
+                    'grasp_z_offset',
+                    overrides.get('grasp_z_offset', self.get_parameter('grasp_z_offset').value),
+                )
+            )
         grasp.position.z = target_z + grasp_z_offset
         retreat = copy.deepcopy(grasp)
         retreat.position.z += lift_height
+        selected_yaw_info = None
         use_vision_orientation = bool(overrides.get('use_vision_grasp_orientation', False))
-        if pose_is_grasp and use_vision_orientation and self._valid_orientation(object_pose):
-            approach.orientation = copy.deepcopy(object_pose.orientation)
-            grasp.orientation = copy.deepcopy(object_pose.orientation)
-            retreat.orientation = copy.deepcopy(object_pose.orientation)
-        close_pos = GRIPPER_CLOSE_POSITIONS.get(object_name, 0.8)
-        approach_duration = float(overrides.get('approach_duration', self.get_parameter('move_duration').value))
-        descent_duration = float(overrides.get('descent_duration', self.get_parameter('move_duration').value))
-        lift_duration = float(overrides.get('lift_duration', self.get_parameter('move_duration').value))
+        if pose_is_grasp and self._valid_orientation(object_pose):
+            base_yaw = self.yaw_from_pose(object_pose)
+            yaw_mode = str(profile.get('yaw_mode', overrides.get('yaw_mode', 'default')) or 'default')
+            yaw_values = self.grasp_yaw_values(base_yaw, yaw_mode)
+            selected_pose, selected_yaw_info = self.select_reachable_grasp_orientation(
+                grasp,
+                object_name,
+                yaw_values,
+            )
+            if selected_pose is not None:
+                approach.orientation = copy.deepcopy(selected_pose.orientation)
+                approach_low.orientation = copy.deepcopy(selected_pose.orientation)
+                grasp.orientation = copy.deepcopy(selected_pose.orientation)
+                retreat.orientation = copy.deepcopy(selected_pose.orientation)
+            elif object_name in {'banana', 'hammer'}:
+                raise RuntimeError(
+                    f'Yaw-aware IK failed for risky object {object_name}; skipping instead of using fixed orientation.'
+                )
+            elif use_vision_orientation:
+                self.get_logger().warn(
+                    f'Yaw-aware IK failed for {object_name}; using transformed vision orientation.'
+                )
+                approach.orientation = copy.deepcopy(object_pose.orientation)
+                approach_low.orientation = copy.deepcopy(object_pose.orientation)
+                grasp.orientation = copy.deepcopy(object_pose.orientation)
+                retreat.orientation = copy.deepcopy(object_pose.orientation)
+            elif object_name in {'meat_can', 'coke_can', 'strawberry'}:
+                self.get_logger().warn(
+                    f'Yaw-aware IK failed for low-risk symmetric {object_name}; using default orientation.'
+                )
+            else:
+                self.get_logger().warn(
+                    f'Yaw-aware IK failed for {object_name}; default orientation may be risky.'
+                )
+        close_pos = float(profile.get('close_pos', GRIPPER_CLOSE_POSITIONS.get(object_name, 0.8)))
+        gripper_width_estimate = close_pos
+        try:
+            grasp_json = getattr(self.pose_provider, 'latest_grasp_json', '') or ''
+            grasp_data = json.loads(grasp_json) if grasp_json else {}
+            selected = grasp_data.get('selected') if isinstance(grasp_data.get('selected'), dict) else grasp_data
+            for key in ('estimated_width', 'grasp_width', 'gripper_width_estimate'):
+                if key in selected:
+                    gripper_width_estimate = float(selected[key])
+                    break
+        except Exception:
+            gripper_width_estimate = close_pos
+        min_pick_durations = {
+            'meat_can': (2.2, 1.6, 2.0),
+            'coke_can': (2.2, 1.6, 2.0),
+            'strawberry': (2.3, 1.6, 2.0),
+            'banana': (3.0, 2.4, 3.0),
+            'hammer': (3.2, 2.8, 3.2),
+        }
+        min_approach, min_descent, min_lift = min_pick_durations.get(
+            object_name,
+            (2.5, 2.0, 2.5),
+        )
+        approach_duration = max(
+            min_approach,
+            float(overrides.get('approach_duration', self.get_parameter('move_duration').value)),
+        )
+        descent_duration = max(
+            min_descent,
+            float(overrides.get('descent_duration', self.get_parameter('move_duration').value)),
+        )
+        lift_duration = max(
+            min_lift,
+            float(overrides.get('lift_duration', self.get_parameter('move_duration').value)),
+        )
         post_close_sleep = float(overrides.get('post_close_sleep', 0.0))
         close_force = float(overrides.get('close_force', 1.0))
-        close_timeout = float(overrides.get('close_timeout', 3.0))
+        close_timeout = float(profile.get('close_timeout', overrides.get('close_timeout', 3.0)))
+        velocity_scale = self._bounded_motion_scale(
+            profile.get('velocity_scale', overrides.get('velocity_scale', 1.0))
+        )
+        acceleration_scale = self._bounded_motion_scale(
+            profile.get('acceleration_scale', overrides.get('acceleration_scale', velocity_scale))
+        )
+        if velocity_scale < 0.999:
+            approach_duration /= velocity_scale
+            descent_duration /= velocity_scale
+            lift_duration /= velocity_scale
 
         pick_plan = {
+            'object_name': object_name,
+            'grasp_profile': profile,
+            'strategy': profile.get('strategy', overrides.get('strategy', 'unknown')),
+            'yaw_mode': profile.get('yaw_mode', 'default'),
             'approach_pose': approach,
+            'approach_low_pose': approach_low,
             'grasp_pose': grasp,
             'retreat_pose': retreat,
             'close_pos': close_pos,
+            'grasp_z_offset': grasp_z_offset,
+            'target_z_surface': target_z,
+            'z_commanded': grasp.position.z,
+            'approach_height': approach_height,
+            'lift_height': lift_height,
             'pick_pan_angle': math.atan2(target_y, target_x),
             'pose_is_grasp': pose_is_grasp,
-            'gripper_width_estimate': close_pos,
+            'gripper_width_estimate': gripper_width_estimate,
             'approach_duration': approach_duration,
             'descent_duration': descent_duration,
             'lift_duration': lift_duration,
             'post_close_sleep': post_close_sleep,
             'close_force': close_force,
             'close_timeout': close_timeout,
+            'velocity_scale': velocity_scale,
+            'acceleration_scale': acceleration_scale,
+            'selected_yaw_info': selected_yaw_info or {},
         }
         self.get_logger().info(
             f'Pick plan for {object_name}: '
             f'pose_is_grasp={pose_is_grasp}, '
             f'approach={self._pose_summary(approach)}, '
+            f'approach_low={self._pose_summary(approach_low)}, '
             f'grasp={self._pose_summary(grasp)}, '
             f'retreat={self._pose_summary(retreat)}, '
-            f'close_pos={close_pos:.3f}, close_timeout={close_timeout:.1f}'
+            f'close_pos={close_pos:.3f}, close_timeout={close_timeout:.1f}, '
+            f'velocity_scale={velocity_scale:.2f}, acceleration_scale={acceleration_scale:.2f}, '
+            f'selected_yaw={pick_plan["selected_yaw_info"].get("selected_yaw")}'
         )
         return pick_plan
 
@@ -198,10 +343,11 @@ class PickPlaceMixin:
 
         try:
             self.get_logger().info(
-                f'Executing pick for {object_name}: '
-                f'approach_duration={pick_plan["approach_duration"]:.2f}, '
-                f'descent_duration={pick_plan["descent_duration"]:.2f}, '
-                f'lift_duration={pick_plan["lift_duration"]:.2f}'
+            f'Executing pick for {object_name}: '
+            f'approach_duration={pick_plan["approach_duration"]:.2f}, '
+            f'descent_duration={pick_plan["descent_duration"]:.2f}, '
+            f'lift_duration={pick_plan["lift_duration"]:.2f}, '
+            f'configured_close_pos={pick_plan["close_pos"]:.3f}'
             )
             move_gripper.gripper_open(self)
             self.move_tool_pose(
@@ -209,8 +355,12 @@ class PickPlaceMixin:
                 duration=pick_plan['approach_duration'],
             )
             self.move_tool_pose(
+                pick_plan['approach_low_pose'],
+                duration=max(2.0, pick_plan['descent_duration'] * 0.5),
+            )
+            self.move_tool_pose(
                 pick_plan['grasp_pose'],
-                duration=pick_plan['descent_duration'],
+                duration=max(2.0, pick_plan['descent_duration'] * 0.7),
             )
             move_gripper.gripper_close(
                 self,
@@ -218,6 +368,14 @@ class PickPlaceMixin:
                 timeout=int(math.ceil(float(pick_plan.get('close_timeout', 3.0)))),
                 gripper_close_pos=pick_plan['close_pos'],
             )
+            self.get_logger().info(
+                f'Gripper close debug: object_name={object_name}, '
+                f'estimated_width={float(pick_plan.get("gripper_width_estimate", 0.0)):.3f}, '
+                f'configured_close_pos={float(pick_plan["close_pos"]):.3f}, '
+                f'actual_close_pos={getattr(self, "js_gripper_position", "unknown")}, '
+                f'gripper_result=command_sent'
+            )
+            time.sleep(0.25)
             if pick_plan.get('post_close_sleep', 0.0) > 0.0:
                 time.sleep(float(pick_plan['post_close_sleep']))
             self.move_tool_pose(
@@ -253,6 +411,13 @@ class PickPlaceMixin:
 
         config = PLACE_CONFIGS[destination]
         override = STORAGE_OBJECT_OVERRIDES.get(object_name, {})
+        profile = self.object_grasp_profile(object_name)
+        velocity_scale = self._bounded_motion_scale(
+            profile.get('velocity_scale', override.get('velocity_scale', 1.0))
+        )
+        acceleration_scale = self._bounded_motion_scale(
+            profile.get('acceleration_scale', override.get('acceleration_scale', velocity_scale))
+        )
         count = self.place_counts[destination]
 
         # --- SMART PLACEMENT LOGIC ---
@@ -302,13 +467,20 @@ class PickPlaceMixin:
         place_joint = [place_pan_angle, -math.pi / 2.0, 1.0, -math.pi / 3.0, -math.pi / 2.0, 0.0]
         rot_time = calc_rot_time(current_pan, place_pan_angle)
 
-        approach_duration = float(override.get('approach_duration', config.get('approach_duration', 1.5)))
-        release_duration = float(override.get('release_duration', config.get('release_duration', 1.0)))
+        approach_duration = max(2.8, float(override.get('approach_duration', config.get('approach_duration', 2.8))))
+        release_duration = max(2.0, float(override.get('release_duration', config.get('release_duration', 2.0))))
         open_timeout = int(math.ceil(float(override.get('open_timeout', config.get('open_timeout', 2.5)))))
         post_release_sleep = float(override.get('post_release_sleep', config.get('post_release_sleep', 0.8)))
-        retreat_duration = float(override.get('retreat_duration', config.get('retreat_duration', 1.0)))
+        retreat_duration = max(3.0, float(override.get('retreat_duration', config.get('retreat_duration', 3.0))))
+        if velocity_scale < 0.999:
+            approach_duration /= velocity_scale
+            release_duration /= velocity_scale
+            retreat_duration /= velocity_scale
 
-        self.get_logger().info(f'Place {object_name} in {destination}: x={x:.3f}, y={y:.3f}, z={release_z:.3f}')
+        self.get_logger().info(
+            f'Place {object_name} in {destination}: x={x:.3f}, y={y:.3f}, z={release_z:.3f}, '
+            f'velocity_scale={velocity_scale:.2f}, acceleration_scale={acceleration_scale:.2f}'
+        )
 
         if self.is_dry_run_motion():
             self.get_logger().info(f'DRY RUN place sequence for {object_name} in {destination}.')
@@ -318,35 +490,26 @@ class PickPlaceMixin:
         # --- CRASH PROTECTION (TRY/EXCEPT) ---
         try:
             # Attempt to execute the trajectory smoothly
-            self.execute_trajectory([place_joint, approach, release], durations=[rot_time, approach_duration, release_duration])
+            self.execute_trajectory([place_joint, approach], durations=[rot_time, approach_duration])
+            prefetch = getattr(self, 'start_prefetch_next_task_pose', None)
+            if callable(prefetch):
+                prefetch()
+            self.execute_trajectory([release], durations=[release_duration])
             move_gripper.gripper_open(self, timeout=open_timeout)
 
             if post_release_sleep > 0.0:
                 time.sleep(post_release_sleep)
 
-            # --- TEST 2: GRIPPER CHECK ---
-            print(f"\n{'='*60}")
-            print("🛑 TEST 2: THE GRIPPER MUST BE FULLY OPEN HERE")
-            
-            # Print the single variable
-            gripper_pos = getattr(self, 'js_gripper_position', 'Unknown')
-            if isinstance(gripper_pos, float):
-                print(f"👐 CURRENT GRIPPER VALUE: {round(gripper_pos, 4)}")
-            else:
-                print(f"👐 CURRENT GRIPPER VALUE: {gripper_pos}")
-            
-            print("Check in Gazebo. If you press Enter, the arm will retreat up.")
-            print(f"{'='*60}")
-            sys.stdout.flush()
-            # ----------------------------------------
+            self.get_logger().info(
+                f'Gripper opened after place; current gripper value={getattr(self, "js_gripper_position", "unknown")}'
+            )
 
-            # 3. Only AFTER your green light, the robot retreats!
             self.move_tool_pose(retreat, duration=retreat_duration)
             self.place_counts[destination] = count + 1
 
             if bool(override.get('return_home_after_place', config.get('return_home_after_place', False))):
                 self.get_logger().info('Returning to HOME_JOINTS after storage placement.')
-                self.move_joint(HOME_JOINTS, duration=float(override.get('return_home_duration', config.get('return_home_duration', 2.2))))
+                self.move_joint(HOME_JOINTS, duration=max(4.0, float(override.get('return_home_duration', config.get('return_home_duration', 4.0)))))
 
         except RuntimeError as e:
             # If the robot hits the box or fails during the movement, catch the error
@@ -391,11 +554,11 @@ class PickPlaceMixin:
             max_time=2.5,
         )
 
-        approach_duration = float(config.get('approach_duration', 1.5))
-        release_duration = float(config.get('release_duration', 1.0))
+        approach_duration = max(2.8, float(config.get('approach_duration', 2.8)))
+        release_duration = max(2.0, float(config.get('release_duration', 2.0)))
         open_timeout = int(math.ceil(float(config.get('open_timeout', 2.0))))
         post_release_sleep = float(config.get('post_release_sleep', 0.8))
-        retreat_duration = float(config.get('retreat_duration', 1.8))
+        retreat_duration = max(3.0, float(config.get('retreat_duration', 3.0)))
 
         self.get_logger().info(
             f'Place {object_name} on shelf: '
@@ -407,9 +570,13 @@ class PickPlaceMixin:
             return
 
         self.execute_trajectory(
-            [place_joint, approach, release],
-            durations=[rot_time, approach_duration, release_duration],
+            [place_joint, approach],
+            durations=[rot_time, approach_duration],
         )
+        prefetch = getattr(self, 'start_prefetch_next_task_pose', None)
+        if callable(prefetch):
+            prefetch()
+        self.execute_trajectory([release], durations=[release_duration])
         move_gripper.gripper_open(self, timeout=open_timeout)
         if post_release_sleep > 0.0:
             time.sleep(post_release_sleep)
@@ -418,7 +585,7 @@ class PickPlaceMixin:
         self.place_counts['shelf'] = count + 1
         if bool(config.get('return_home_after_place', False)):
             self.get_logger().info('Returning to HOME_JOINTS after shelf placement.')
-            self.move_joint(HOME_JOINTS, duration=float(config.get('return_home_duration', 2.4)))
+            self.move_joint(HOME_JOINTS, duration=max(4.0, float(config.get('return_home_duration', 4.0))))
 
     def needs_bookshelf_wrist_flip(self, object_name):
         base_name = str(object_name).strip().lower().split('_')[0]
@@ -472,20 +639,86 @@ class PickPlaceMixin:
             f'q=({q.x:.3f}, {q.y:.3f}, {q.z:.3f}, {q.w:.3f})'
         )
 
+    @staticmethod
+    def _bounded_motion_scale(value):
+        try:
+            return max(0.10, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    @staticmethod
+    def grasp_yaw_values(base_yaw, yaw_mode):
+        mode = str(yaw_mode or 'default').strip().lower()
+        if mode == 'vision':
+            return [float(base_yaw)]
+        if mode == 'vision_plus_90':
+            return yaw_candidates(float(base_yaw) + math.pi / 2.0)
+        if mode == 'default':
+            return yaw_candidates(0.0)
+        return yaw_candidates(float(base_yaw))
+
+    @staticmethod
+    def _loads_json(text):
+        try:
+            return json.loads(text) if text else {}
+        except Exception:
+            return {'raw': str(text)}
+
+    def _latest_detection_debug(self):
+        provider = getattr(self, 'pose_provider', None)
+        data = self._loads_json(getattr(provider, 'latest_detection_json', '') or '')
+        if not isinstance(data, dict):
+            return {}
+        bbox = data.get('bbox_xyxy', data.get('bbox', []))
+        return {
+            'label': data.get('label', ''),
+            'score': float(data.get('score', data.get('semantic_score', 0.0)) or 0.0),
+            'camera': data.get('camera_name', data.get('camera', '')),
+            'bbox': bbox,
+            'backend': data.get('backend', ''),
+            'final_score': float(data.get('final_score', 0.0) or 0.0),
+            'transform_mode': data.get('transform_mode', data.get('center_transform_mode', '')),
+        }
+
+    def _latest_grasp_debug(self):
+        provider = getattr(self, 'pose_provider', None)
+        data = self._loads_json(getattr(provider, 'latest_grasp_json', '') or '')
+        if not isinstance(data, dict):
+            return {}
+        selected = data.get('selected') if isinstance(data.get('selected'), dict) else data
+        if not isinstance(selected, dict):
+            selected = {}
+        return selected
+
     def publish_motion_debug(self, object_name, pick_plan, success, error=''):
         publisher = getattr(self, 'grasp_debug_pub', None)
         if publisher is None:
             return
+        selected_grasp = self._latest_grasp_debug()
         payload = {
             'object_label': object_name,
+            'strategy': pick_plan.get('strategy', ''),
+            'yaw_mode': pick_plan.get('yaw_mode', ''),
+            'grasp_profile': pick_plan.get('grasp_profile', {}),
             'pre_grasp_pose': self._pose_to_dict(pick_plan.get('approach_pose')),
+            'pre_grasp_low_pose': self._pose_to_dict(pick_plan.get('approach_low_pose')),
             'final_grasp_pose': self._pose_to_dict(pick_plan.get('grasp_pose')),
             'retreat_pose': self._pose_to_dict(pick_plan.get('retreat_pose')),
             'gripper_width_estimate': float(pick_plan.get('gripper_width_estimate', 0.0)),
             'close_pos': float(pick_plan.get('close_pos', 0.0)),
             'close_force': float(pick_plan.get('close_force', 1.0)),
             'close_timeout': float(pick_plan.get('close_timeout', 3.0)),
+            'grasp_z_offset': float(pick_plan.get('grasp_z_offset', 0.0)),
+            'z_surface': float(pick_plan.get('target_z_surface', 0.0)),
+            'z_commanded': float(pick_plan.get('z_commanded', 0.0)),
+            'approach_height': float(pick_plan.get('approach_height', 0.0)),
+            'lift_height': float(pick_plan.get('lift_height', 0.0)),
+            'velocity_scale': float(pick_plan.get('velocity_scale', 1.0)),
+            'acceleration_scale': float(pick_plan.get('acceleration_scale', 1.0)),
             'pose_is_grasp': bool(pick_plan.get('pose_is_grasp', False)),
+            'selected_yaw_info': pick_plan.get('selected_yaw_info', {}),
+            'selected_detection': self._latest_detection_debug(),
+            'selected_grasp_debug': selected_grasp,
             'motion_success': bool(success),
             'motion_error': error,
         }
@@ -493,3 +726,64 @@ class PickPlaceMixin:
             publisher.publish(String(data=json.dumps(payload)))
         except Exception:
             pass
+        motion_publisher = getattr(self, 'motion_debug_pub', None)
+        if motion_publisher is not None:
+            try:
+                motion_publisher.publish(String(data=json.dumps(payload)))
+            except Exception:
+                pass
+        calibration_publisher = getattr(self, 'grasp_calibration_debug_pub', None)
+        if calibration_publisher is not None:
+            grasp_pose = pick_plan.get('grasp_pose')
+            frame = self.get_parameter('base_frame').value if hasattr(self, 'get_parameter') else 'base_link'
+            yaw = None
+            try:
+                yaw = self.yaw_from_pose(grasp_pose)
+            except Exception:
+                yaw = pick_plan.get('selected_yaw_info', {}).get('selected_yaw')
+            calibration_payload = {
+                'object': object_name,
+                'strategy': pick_plan.get('strategy', ''),
+                'selected_detection': payload['selected_detection'],
+                'grasp': {
+                    'frame': frame,
+                    'x': float(getattr(getattr(grasp_pose, 'position', None), 'x', 0.0)),
+                    'y': float(getattr(getattr(grasp_pose, 'position', None), 'y', 0.0)),
+                    'z_surface': float(pick_plan.get('target_z_surface', 0.0)),
+                    'z_commanded': float(pick_plan.get('z_commanded', 0.0)),
+                    'yaw': float(yaw) if yaw is not None else None,
+                    'grasp_score': float(
+                        selected_grasp.get(
+                            'grasp_score',
+                            selected_grasp.get('score', 0.0),
+                        )
+                        or 0.0
+                    ),
+                },
+                'gripper': {
+                    'estimated_width': float(pick_plan.get('gripper_width_estimate', 0.0)),
+                    'close_pos': float(pick_plan.get('close_pos', 0.0)),
+                    'close_timeout': float(pick_plan.get('close_timeout', 3.0)),
+                    'actual_close_pos': str(getattr(self, 'js_gripper_position', 'unknown')),
+                },
+                'motion': {
+                    'approach_height': float(pick_plan.get('approach_height', 0.0)),
+                    'lift_height': float(pick_plan.get('lift_height', 0.0)),
+                    'approach_duration': float(pick_plan.get('approach_duration', 0.0)),
+                    'descent_duration': float(pick_plan.get('descent_duration', 0.0)),
+                    'lift_duration': float(pick_plan.get('lift_duration', 0.0)),
+                    'velocity_scale': float(pick_plan.get('velocity_scale', 1.0)),
+                    'acceleration_scale': float(pick_plan.get('acceleration_scale', 1.0)),
+                },
+                'profile': pick_plan.get('grasp_profile', {}),
+                'result': {
+                    'pick_success': bool(success),
+                    'failure_reason': error or None,
+                },
+            }
+            try:
+                text = json.dumps(calibration_payload)
+                calibration_publisher.publish(String(data=text))
+                self.get_logger().info(f'Grasp calibration debug: {text}')
+            except Exception:
+                pass

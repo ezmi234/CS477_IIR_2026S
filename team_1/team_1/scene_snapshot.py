@@ -11,6 +11,9 @@ class SceneObject:
     center_xyz: tuple[float, float, float] | None = None
     score: float = 0.0
     camera_name: str = ''
+    grasp_score: float = 0.0
+    reachability_score: float = 0.0
+    isolation_score: float = 0.0
     blocked_by: set[str] = field(default_factory=set)
     blocks: set[str] = field(default_factory=set)
 
@@ -63,8 +66,13 @@ def scene_object_from_probe(name, pose, detection_json):
         pose=pose,
         bbox_xyxy=tuple(int(v) for v in bbox) if bbox and len(bbox) == 4 else None,
         center_xyz=tuple(float(v) for v in center) if center and len(center) >= 3 else None,
-        score=float(detection.get('score', detection.get('rank_score', 0.0)) or 0.0),
+        score=float(
+            detection.get('final_score', detection.get('rank_score', detection.get('score', 0.0))) or 0.0
+        ),
         camera_name=str(detection.get('camera_name', '') or ''),
+        grasp_score=float(detection.get('grasp_score', 0.0) or 0.0),
+        reachability_score=float(detection.get('reachability_score', 0.0) or 0.0),
+        isolation_score=float(detection.get('isolation_score', 0.0) or 0.0),
     )
 
 
@@ -108,5 +116,8 @@ def format_snapshot_summary(snapshot):
             parts.append(f'{name}:not_visible')
             continue
         blocked = f',blocked_by={sorted(obj.blocked_by)}' if obj.blocked_by else ''
-        parts.append(f'{name}:visible,score={obj.score:.2f}{blocked}')
+        parts.append(
+            f'{name}:visible,score={obj.score:.2f},reach={obj.reachability_score:.2f},'
+            f'grasp={obj.grasp_score:.2f}{blocked}'
+        )
     return '; '.join(parts)

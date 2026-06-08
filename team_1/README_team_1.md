@@ -1,5 +1,10 @@
 # Team 1 Final Runtime
 
+First terminal: start the TA simulator as instructed in the contest materials.
+```bash
+ros2 launch manip_challenge ur5_setup_random_picking.launch.py
+```
+
 Final CS477 IIR Manipulation Challenge package:
 
 ```bash

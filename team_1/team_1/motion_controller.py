@@ -1,4 +1,5 @@
 import os
+import json
 import time
 
 import numpy as np
@@ -13,6 +14,7 @@ from geometry_msgs.msg import Pose, PoseStamped
 from hrl_geom.pose_converter import PoseConv
 from pykdl_utils.kdl_kinematics import create_kdl_kin
 from rosidl_runtime_py import message_to_yaml
+from std_msgs.msg import String
 from tf2_ros import TransformException
 from tf2_ros.buffer_interface import TypeException
 
@@ -24,6 +26,19 @@ except Exception:
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .config import HOME_JOINTS, IK_SEEDS, JOINT_NAMES, REFERENCE_GRASP_JOINTS
+from .dls_ik import (
+    DEFAULT_JOINT_LIMITS,
+    IKDiagnostics,
+    score_candidate,
+    solve_dls_ik,
+)
+from .grasp_orientation import (
+    normalize_angle,
+    tool_quaternion_with_yaw,
+    yaw_candidates,
+    yaw_from_quaternion,
+)
+from .motion_policy import bounded_joint_score, duration_from_joint_distance, is_path_tolerance_error
 
 
 def _quat_normalize(q):
@@ -130,6 +145,13 @@ class MotionMixin:
             )
         return False
 
+    def safe_duration(self, target, min_duration):
+        return duration_from_joint_distance(
+            self.js_joint_position or HOME_JOINTS,
+            target,
+            min_duration=float(min_duration),
+        )
+
     def transform_pose(self, pose, source_frame, target_frame):
         stamped = PoseStamped()
         stamped.header.frame_id = source_frame
@@ -227,6 +249,20 @@ class MotionMixin:
         pose.orientation = self.default_tool_orientation()
         return pose
 
+    def make_tool_pose_with_yaw(self, x, y, z, yaw, object_name='object'):
+        del object_name
+        pose = Pose()
+        pose.position.x = float(x)
+        pose.position.y = float(y)
+        pose.position.z = float(z)
+        default_q = self.default_tool_orientation()
+        q = tool_quaternion_with_yaw(
+            (default_q.x, default_q.y, default_q.z, default_q.w),
+            float(yaw),
+        )
+        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = q
+        return pose
+
     def make_shelf_tool_pose(self, x, y, z):
         return misc.list2Pose([float(x), float(y), float(z), 0.0, 0.0, 0.0])
 
@@ -274,6 +310,158 @@ class MotionMixin:
             duration = self.get_parameter('move_duration').value
         self.move_joint(q_solution.tolist(), duration=duration)
 
+    def select_reachable_grasp_orientation(self, grasp_base, object_name, candidate_yaws):
+        records = []
+        best = None
+        current = list(self.js_joint_position or HOME_JOINTS)
+        for yaw in candidate_yaws:
+            yaw = normalize_angle(float(yaw))
+            pose = self.make_tool_pose_with_yaw(
+                grasp_base.position.x,
+                grasp_base.position.y,
+                grasp_base.position.z,
+                yaw,
+                object_name,
+            )
+            pregrasp = self.make_tool_pose_with_yaw(
+                grasp_base.position.x,
+                grasp_base.position.y,
+                grasp_base.position.z + 0.08,
+                yaw,
+                object_name,
+            )
+            q_pre = self.solve_ik(self.detach_tool(pregrasp), preferred_seed=current)
+            q_grasp = self.solve_ik(self.detach_tool(pose), preferred_seed=q_pre if q_pre is not None else current)
+            valid = q_pre is not None and q_grasp is not None
+            score = float('inf')
+            reject_reason = None
+            if valid:
+                q_pre_list = q_pre.tolist()
+                q_list = q_grasp.tolist()
+                current_to_pre = max(abs(a - b) for a, b in zip(current, q_pre_list))
+                pre_to_grasp = max(abs(a - b) for a, b in zip(q_pre_list, q_list))
+                shoulder_elbow_near_limit = (
+                    abs(q_list[1]) > 2.75
+                    or abs(q_list[2]) > 2.90
+                    or abs(q_pre_list[1]) > 2.75
+                    or abs(q_pre_list[2]) > 2.90
+                )
+                if abs(q_list[0]) > 2.85 or shoulder_elbow_near_limit:
+                    valid = False
+                    reject_reason = 'joint_extreme'
+                elif current_to_pre > 2.75 or pre_to_grasp > 1.35:
+                    valid = False
+                    reject_reason = 'joint_jump'
+                else:
+                    score = (
+                        0.70 * bounded_joint_score(current, q_pre_list)
+                        + 1.00 * bounded_joint_score(q_pre_list, q_list)
+                        + 0.20 * bounded_joint_score(HOME_JOINTS, q_list)
+                    )
+            else:
+                reject_reason = 'ik_failed'
+            record = {
+                'yaw': yaw,
+                'valid': bool(valid),
+                'score': float(score) if np.isfinite(score) else None,
+                'reject_reason': reject_reason,
+                'q_pregrasp': q_pre.tolist() if q_pre is not None else None,
+                'q_grasp': q_grasp.tolist() if q_grasp is not None else None,
+            }
+            records.append(record)
+            self.get_logger().info(
+                f'IK yaw candidate for {object_name}: yaw={yaw:.3f}, '
+                f'valid={bool(valid)}, score={record["score"]}, reject={reject_reason}'
+            )
+            if valid and (best is None or score < best['score']):
+                best = {
+                    'yaw': yaw,
+                    'score': score,
+                    'pose': pose,
+                    'q_pregrasp': q_pre.tolist(),
+                    'q_grasp': q_grasp.tolist(),
+                }
+        if best is None:
+            return None, {'selected_yaw': None, 'candidates': records}
+        self.get_logger().info(
+            f'Selected grasp yaw for {object_name}: yaw={best["yaw"]:.3f}, '
+            f'ik_score={best["score"]:.3f}'
+        )
+        return best['pose'], {'selected_yaw': float(best['yaw']), 'candidates': records}
+
+    def yaw_from_pose(self, pose):
+        q = pose.orientation
+        return yaw_from_quaternion((q.x, q.y, q.z, q.w))
+
+    def guarded_move_joint(self, target, min_duration, label='move_joint'):
+        duration = self.safe_duration(target, min_duration)
+        self.get_logger().info(
+            f'Guarded joint move {label}: min_duration={float(min_duration):.2f}, '
+            f'planned_duration={duration:.2f}'
+        )
+        return self.move_joint(target, duration=duration, label=label)
+
+    def split_joint_targets_by_delta(self, q_start, joint_targets, durations):
+        max_delta = float(self.motion_param('max_joint_delta_per_trajectory', 1.20))
+        if max_delta <= 0.0:
+            return joint_targets, durations, 0
+        split_targets = []
+        split_durations = []
+        prev = np.asarray(q_start, dtype=float)
+        inserted = 0
+        for target, duration in zip(joint_targets, durations):
+            target_arr = np.asarray(target, dtype=float)
+            delta = target_arr - prev
+            max_abs = float(np.max(np.abs(delta))) if delta.size else 0.0
+            pieces = max(1, int(np.ceil(max_abs / max_delta)))
+            for piece in range(1, pieces + 1):
+                alpha = float(piece) / float(pieces)
+                split_targets.append((prev + delta * alpha).tolist())
+                split_durations.append(float(duration) / float(pieces))
+            if pieces > 1:
+                inserted += pieces - 1
+            prev = target_arr
+        return split_targets, split_durations, inserted
+
+    def motion_param(self, name, default):
+        try:
+            return self.get_parameter(name).value
+        except Exception:
+            return default
+
+    def publish_ik_debug(self, diag, *, ee_pose=None, candidate_index=None):
+        if diag is None:
+            return
+        if isinstance(diag, IKDiagnostics):
+            payload = diag.to_dict()
+        elif isinstance(diag, dict):
+            payload = dict(diag)
+        else:
+            return
+        task = getattr(self, 'current_task', None)
+        object_name = getattr(task, 'object_name', None) or payload.get('object') or 'object'
+        payload['object'] = object_name
+        payload['candidate'] = candidate_index
+        if ee_pose is not None:
+            try:
+                q = ee_pose.orientation
+                payload['pose'] = [
+                    float(ee_pose.position.x),
+                    float(ee_pose.position.y),
+                    float(ee_pose.position.z),
+                ]
+                payload['yaw'] = yaw_from_quaternion((q.x, q.y, q.z, q.w))
+            except Exception:
+                pass
+        text = json.dumps(payload)
+        publisher = getattr(self, 'ik_debug_pub', None)
+        if publisher is not None:
+            try:
+                publisher.publish(String(data=text))
+            except Exception:
+                pass
+        self.get_logger().info(f'IK debug: {text}')
+
     def solve_ik(self, ee_pose, preferred_seed=None):
         guesses = []
         if preferred_seed is not None:
@@ -283,6 +471,7 @@ class MotionMixin:
         guesses.extend(IK_SEEDS)
 
         seen = set()
+        candidates = []
         for guess in guesses:
             key = tuple(round(float(v), 3) for v in guess)
             if key in seen:
@@ -290,7 +479,82 @@ class MotionMixin:
             seen.add(key)
             solution = self.arm_kdl.inverse(ee_pose, q_guess=np.array(guess, dtype=float))
             if solution is not None:
-                return solution
+                q = np.asarray(solution, dtype=float).flatten()
+                if q.shape[0] == 6:
+                    candidates.append((len(candidates), q, guess))
+
+        current = list(self.js_joint_position or HOME_JOINTS)
+        sigma_threshold = float(self.motion_param('ik_sigma_threshold', 0.02))
+        condition_threshold = float(self.motion_param('ik_condition_threshold', 500.0))
+        max_joint_delta = float(self.motion_param('ik_max_joint_delta', 2.75))
+        max_wrist_flip = float(self.motion_param('ik_max_wrist_flip', np.pi))
+        joint_limits = DEFAULT_JOINT_LIMITS
+        diagnostics = []
+        for index, q, _guess in candidates:
+            diag = score_candidate(
+                self.arm_kdl,
+                q,
+                current,
+                HOME_JOINTS,
+                joint_limits=joint_limits,
+                sigma_threshold=sigma_threshold,
+                condition_threshold=condition_threshold,
+                max_joint_delta=max_joint_delta,
+                max_wrist_flip=max_wrist_flip,
+            )
+            diag.extra['source'] = 'kdl_inverse'
+            diagnostics.append((index, q, diag))
+            self.publish_ik_debug(diag, ee_pose=ee_pose, candidate_index=index)
+
+        accepted = [(index, q, diag) for index, q, diag in diagnostics if diag.accepted]
+        if accepted:
+            index, q, diag = sorted(accepted, key=lambda item: float(item[2].score or 0.0))[0]
+            diag.accepted = True
+            diag.reject_reason = None
+            diag.extra['selected_ik_method'] = 'kdl'
+            self.publish_ik_debug(diag, ee_pose=ee_pose, candidate_index=index)
+            return np.asarray(q, dtype=float)
+
+        lambda_base = float(self.motion_param('ik_lambda_base', 0.04))
+        for seed_index, seed in enumerate(guesses or [current]):
+            q_dls, diag = solve_dls_ik(
+                self.arm_kdl,
+                ee_pose,
+                seed,
+                current,
+                HOME_JOINTS,
+                joint_limits=joint_limits,
+                sigma_threshold=sigma_threshold,
+                condition_threshold=condition_threshold,
+                lambda_base=lambda_base,
+            )
+            diag.extra['source'] = 'dls_fallback'
+            self.publish_ik_debug(diag, ee_pose=ee_pose, candidate_index=seed_index)
+            if q_dls is not None and diag.accepted:
+                diag.extra['selected_ik_method'] = 'dls'
+                self.publish_ik_debug(diag, ee_pose=ee_pose, candidate_index=seed_index)
+                return np.asarray(q_dls, dtype=float)
+
+        if diagnostics:
+            index, _q, diag = sorted(
+                diagnostics,
+                key=lambda item: float(item[2].score if item[2].score is not None else 1e9),
+            )[0]
+            diag.accepted = False
+            diag.reject_reason = diag.reject_reason or 'no_stable_ik_candidate'
+            self.publish_ik_debug(diag, ee_pose=ee_pose, candidate_index=index)
+            self.get_logger().warn(
+                'IK rejected all KDL candidates and DLS fallback failed: '
+                f'reject_reason={diag.reject_reason}, sigma_min={diag.sigma_min}, '
+                f'condition_number={diag.condition_number}, joint_delta_norm={diag.joint_delta_norm:.3f}'
+            )
+        else:
+            self.publish_ik_debug({
+                'ik_method': 'none',
+                'accepted': False,
+                'reject_reason': 'kdl_inverse_failed_no_candidates',
+                'singularity_warning': False,
+            }, ee_pose=ee_pose, candidate_index=None)
         return None
 
     def execute_trajectory(self, waypoints, durations):
@@ -328,15 +592,34 @@ class MotionMixin:
 
         self.send_joint_trajectory(joint_targets, durations)
 
-    def send_joint_trajectory(self, joint_targets, durations):
+    def send_joint_trajectory(self, joint_targets, durations, _retry=True):
         if not joint_targets:
             return
 
-        self.wait_for_arm_settled()
+        self.wait_for_arm_settled(timeout_sec=8.0)
         q_start = list(self.js_joint_position or HOME_JOINTS)
+        joint_targets, durations, inserted = self.split_joint_targets_by_delta(
+            q_start,
+            joint_targets,
+            durations,
+        )
+        if inserted:
+            self.get_logger().warn(
+                f'Split trajectory into {len(joint_targets)} segment(s): '
+                f'inserted={inserted}, max_joint_delta_per_trajectory='
+                f'{float(self.motion_param("max_joint_delta_per_trajectory", 1.20)):.2f}'
+            )
         q_list = [q_start] + [[float(value) for value in q] for q in joint_targets]
+        safe_durations = []
+        for index, duration in enumerate(durations):
+            safe_durations.append(duration_from_joint_distance(
+                q_list[index],
+                q_list[index + 1],
+                min_duration=float(duration),
+            ))
+        durations = safe_durations
         cumulative_times = []
-        start_hold = 0.2
+        start_hold = 0.35
         elapsed = start_hold
         for duration in durations:
             elapsed += float(duration)
@@ -389,23 +672,41 @@ class MotionMixin:
         if result is None:
             raise RuntimeError(f'Joint result failed: {result_future.exception()}')
 
-        self.js_joint_position = list(joint_targets[-1])
         self.get_logger().info('Trajectory result:\n{}'.format(message_to_yaml(result.result)))
         if result.result.error_code != 0:
-            raise RuntimeError(f'Joint trajectory failed: {result.result.error_string}')
+            error = f'Joint trajectory failed: {result.result.error_string}'
+            if _retry and is_path_tolerance_error(error):
+                retry_durations = [max(float(value) * 1.8, float(value) + 1.0) for value in durations]
+                self.get_logger().warn(
+                    f'{error}; retrying once with slower durations={retry_durations}'
+                )
+                self.wait_for_arm_settled(timeout_sec=10.0)
+                return self.send_joint_trajectory(joint_targets, retry_durations, _retry=False)
+            raise RuntimeError(error)
+        self.js_joint_position = list(joint_targets[-1])
+        self.wait_for_arm_settled(timeout_sec=8.0)
 
-    def move_joint(self, angles, duration=4.0):
+    def move_joint(self, angles, duration=4.0, label='move_joint', _retry=True):
+        duration = self.safe_duration(angles, duration)
         if self.is_dry_run_motion():
             self.js_joint_position = [float(a) for a in angles]
             self.get_logger().info(
-                f'DRY RUN move_joint: duration={float(duration):.2f}, '
+                f'DRY RUN {label}: duration={float(duration):.2f}, '
                 f'joints={[round(float(a), 4) for a in angles]}'
             )
             return
 
-        self.wait_for_arm_settled()
+        self.wait_for_arm_settled(timeout_sec=8.0)
         q_start = list(self.js_joint_position or HOME_JOINTS)
-        start_hold = 0.2
+        max_delta = float(self.motion_param('max_joint_delta_per_trajectory', 1.20))
+        max_abs = max(abs(float(a) - float(b)) for a, b in zip(angles, q_start))
+        if max_delta > 0.0 and max_abs > max_delta:
+            self.get_logger().warn(
+                f'{label}: joint jump {max_abs:.3f} exceeds max_joint_delta_per_trajectory='
+                f'{max_delta:.3f}; executing split trajectory.'
+            )
+            return self.send_joint_trajectory([[float(a) for a in angles]], [duration], _retry=_retry)
+        start_hold = 0.35
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = JointTrajectory()
@@ -440,7 +741,21 @@ class MotionMixin:
         if result is None:
             raise RuntimeError(f'Joint result failed: {result_future.exception()}')
 
-        self.js_joint_position = list(angles)
         self.get_logger().info('Joint result:\n{}'.format(message_to_yaml(result.result)))
         if result.result.error_code != 0:
-            raise RuntimeError(f'Joint trajectory failed: {result.result.error_string}')
+            error = f'Joint trajectory failed: {result.result.error_string}'
+            if _retry and is_path_tolerance_error(error):
+                retry_duration = max(float(duration) * 1.8, float(duration) + 1.0)
+                self.get_logger().warn(
+                    f'{error}; retrying {label} once with duration={retry_duration:.2f}'
+                )
+                self.wait_for_arm_settled(timeout_sec=10.0)
+                return self.move_joint(
+                    angles,
+                    duration=retry_duration,
+                    label=f'{label}_retry',
+                    _retry=False,
+                )
+            raise RuntimeError(error)
+        self.js_joint_position = list(angles)
+        self.wait_for_arm_settled(timeout_sec=8.0)

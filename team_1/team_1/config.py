@@ -12,6 +12,7 @@ JOINT_NAMES = [
 ]
 
 HOME_JOINTS = [0.0, -math.pi / 2.0, 1.0, -math.pi / 3.0, -math.pi / 2.0, 0.0]
+OBSERVE_JOINTS = [0.0, -1.35, 1.45, -1.75, -math.pi / 2.0, 0.0]
 REFERENCE_GRASP_JOINTS = [
     0.16456877764159317,
     -1.4026709127086092,
@@ -32,13 +33,13 @@ PLACE_CONFIGS = {
         'use_grasp_orientation': True,
         'approach_z': 0.15,
         'retreat_z': 0.20,
-        'approach_duration': 1.5,
-        'release_duration': 1.0,
+        'approach_duration': 2.8,
+        'release_duration': 2.0,
         'open_timeout': 2.5,
         'post_release_sleep': 0.8,
-        'retreat_duration': 1.0,
+        'retreat_duration': 3.0,
         'return_home_after_place': True,
-        'return_home_duration': 2.2,
+        'return_home_duration': 4.0,
     },
     'right_storage': {
         'range_x': [-0.124, 0.117],
@@ -50,13 +51,13 @@ PLACE_CONFIGS = {
         'use_grasp_orientation': True,
         'approach_z': 0.15,
         'retreat_z': 0.20,
-        'approach_duration': 1.5,
-        'release_duration': 1.0,
+        'approach_duration': 2.8,
+        'release_duration': 2.0,
         'open_timeout': 2.5,
         'post_release_sleep': 0.8,
-        'retreat_duration': 1.0,
+        'retreat_duration': 3.0,
         'return_home_after_place': True,
-        'return_home_duration': 2.2,
+        'return_home_duration': 4.0,
     },
     'shelf': {
         'x': 0.86,
@@ -65,13 +66,13 @@ PLACE_CONFIGS = {
         'approach_x_offset': -0.16,
         'retreat_x_offset': -0.28,
         'retreat_lift_z': 0.02,
-        'approach_duration': 1.7,
-        'release_duration': 1.2,
+        'approach_duration': 2.8,
+        'release_duration': 2.0,
         'open_timeout': 2.5,
         'post_release_sleep': 0.8,
-        'retreat_duration': 2.0,
+        'retreat_duration': 3.0,
         'return_home_after_place': True,
-        'return_home_duration': 2.4,
+        'return_home_duration': 4.0,
     },
 }
 
@@ -103,15 +104,11 @@ HARDCODED_PICK_TARGETS = {
 }
 
 GRIPPER_CLOSE_POSITIONS = {
-    'coke_can': math.radians(14),
-    'meat_can': math.radians(19),
-    # Banana is thin and curved.  The previous value (radians(27) ~= 0.47)
-    # left the Robotiq fingers too open, so the robot could touch/lift near
-    # the banana but fail to pinch it.  Use a tighter close value similar to
-    # the small-object setting.
-    'banana': 0.95,
-    'strawberry': 0.8,
-    'hammer': 0.8,
+    'coke_can': 0.42,
+    'meat_can': 0.38,
+    'strawberry': 0.70,
+    'banana': 0.90,
+    'hammer': 0.75,
 }
 
 PICK_APPROACH_HEIGHTS = {
@@ -133,6 +130,24 @@ PICK_POSITION_OFFSETS = {
 }
 
 OBJECT_PICK_OVERRIDES = {
+    'meat_can': {
+        'approach_duration': 2.3,
+        'descent_duration': 1.8,
+        'lift_duration': 2.2,
+        'close_timeout': 2.5,
+    },
+    'coke_can': {
+        'approach_duration': 2.3,
+        'descent_duration': 1.8,
+        'lift_duration': 2.2,
+        'close_timeout': 2.5,
+    },
+    'strawberry': {
+        'approach_duration': 2.4,
+        'descent_duration': 1.8,
+        'lift_duration': 2.2,
+        'close_timeout': 2.5,
+    },
     'banana': {
         'approach_height': 0.18,
         'lift_height': 0.30,
@@ -146,11 +161,12 @@ OBJECT_PICK_OVERRIDES = {
         'vision_grasp_z_min': -0.080,
         'vision_grasp_z_max': -0.025,
         'close_force': 1.0,
-        'close_timeout': 4.0,
-        'approach_duration': 2.0,
-        'descent_duration': 1.6,
-        'lift_duration': 2.0,
+        'close_timeout': 3.5,
+        'approach_duration': 3.0,
+        'descent_duration': 2.4,
+        'lift_duration': 3.0,
         'post_close_sleep': 0.35,
+        'use_vision_grasp_orientation': True,
     },
     'hammer': {
         'approach_height': 0.18,
@@ -159,10 +175,90 @@ OBJECT_PICK_OVERRIDES = {
         'vision_grasp_z_offset': 0.0,
         'vision_grasp_z_min': -0.045,
         'vision_grasp_z_max': 0.040,
-        'approach_duration': 2.1,
-        'descent_duration': 1.7,
-        'lift_duration': 2.2,
+        'close_timeout': 3.0,
+        'approach_duration': 3.2,
+        'descent_duration': 2.8,
+        'lift_duration': 3.2,
         'post_close_sleep': 0.35,
+        'use_vision_grasp_orientation': True,
+    },
+}
+
+OBJECT_GRASP_PROFILES = {
+    'banana': {
+        'strategy': 'banana_mask_distance_transform',
+        'close_pos': 0.90,
+        'close_timeout': 3.5,
+        'approach_height': 0.16,
+        'grasp_z_offset': -0.010,
+        'vision_grasp_z_offset': -0.018,
+        'vision_grasp_z_min': -0.080,
+        'vision_grasp_z_max': -0.025,
+        'lift_height': 0.28,
+        'yaw_mode': 'local_tangent',
+        'risk': 'medium',
+        'approach_duration': 3.0,
+        'descent_duration': 2.4,
+        'lift_duration': 3.0,
+        'post_close_sleep': 0.35,
+        'use_vision_grasp_orientation': True,
+    },
+    'meat_can': {
+        'strategy': 'can_side_or_top_center',
+        'close_pos': 0.38,
+        'close_timeout': 2.5,
+        'approach_height': 0.12,
+        'grasp_z_offset': -0.010,
+        'lift_height': 0.18,
+        'yaw_mode': 'symmetric_default',
+        'risk': 'low',
+        'approach_duration': 2.3,
+        'descent_duration': 1.8,
+        'lift_duration': 2.2,
+    },
+    'coke_can': {
+        'strategy': 'can_side_or_top_center',
+        'close_pos': 0.42,
+        'close_timeout': 2.5,
+        'approach_height': 0.12,
+        'grasp_z_offset': -0.010,
+        'lift_height': 0.18,
+        'yaw_mode': 'symmetric_default',
+        'risk': 'low',
+        'approach_duration': 2.3,
+        'descent_duration': 1.8,
+        'lift_duration': 2.2,
+    },
+    'strawberry': {
+        'strategy': 'compact_top_center',
+        'close_pos': 0.70,
+        'close_timeout': 2.5,
+        'approach_height': 0.10,
+        'grasp_z_offset': -0.006,
+        'lift_height': 0.14,
+        'yaw_mode': 'symmetric_default',
+        'risk': 'low',
+        'approach_duration': 2.4,
+        'descent_duration': 1.8,
+        'lift_duration': 2.2,
+    },
+    'hammer': {
+        'strategy': 'handle_grasp',
+        'close_pos': 0.75,
+        'close_timeout': 3.0,
+        'approach_height': 0.16,
+        'grasp_z_offset': -0.012,
+        'vision_grasp_z_offset': 0.0,
+        'vision_grasp_z_min': -0.045,
+        'vision_grasp_z_max': 0.040,
+        'lift_height': 0.22,
+        'yaw_mode': 'handle_axis',
+        'risk': 'high',
+        'approach_duration': 3.2,
+        'descent_duration': 2.8,
+        'lift_duration': 3.2,
+        'post_close_sleep': 0.35,
+        'use_vision_grasp_orientation': True,
     },
 }
 
@@ -189,7 +285,7 @@ OBJECT_ALIASES = {
     'meat_can': ['meat can', 'meat_can', 'tin can', 'food can', 'can of meat', 'meat'],
     'coke_can': [
         'coke can', 'coke_can', 'cola can', 'red can', 'red soda can',
-        'coke', 'cola',
+        'soda can', 'drink can', 'beverage can', 'coke', 'cola',
     ],
     'strawberry': ['strawberry'],
     'hammer': ['hammer'],
@@ -205,12 +301,50 @@ OBJECT_ALIASES = {
 }
 
 TASK_EXECUTION_PRIORITY = {
-    'coke_can': 0,
-    'meat_can': 1,
+    'meat_can': 0,
+    'coke_can': 1,
     'strawberry': 2,
-    'hammer': 3,
-    'banana': 4,
+    'banana': 3,
+    'hammer': 4,
 }
+
+OBJECT_SUCCESS_PRIORITY = dict(TASK_EXECUTION_PRIORITY)
+
+OBJECT_RISK = {
+    'meat_can': 'low',
+    'coke_can': 'low',
+    'strawberry': 'low',
+    'banana': 'medium',
+    'hammer': 'high',
+}
+
+MIN_CONFIDENCE = {
+    'meat_can': 0.040,
+    'coke_can': 0.040,
+    'strawberry': 0.040,
+    'banana': 0.070,
+    'hammer': 0.180,
+}
+
+MIN_GRASP_SCORE = {
+    'meat_can': 0.12,
+    'coke_can': 0.12,
+    'strawberry': 0.10,
+    'banana': 0.18,
+    'hammer': 0.35,
+}
+
+MIN_FINAL_CANDIDATE_SCORE = {
+    'meat_can': 0.12,
+    'coke_can': 0.15,
+    'strawberry': 0.15,
+    'banana': 0.50,
+    'hammer': 0.70,
+}
+
+TRIAL_TIME_LIMIT_SEC = 8.0 * 60.0
+SKIP_HAMMER_AFTER_SEC = 6.0 * 60.0
+LOW_RISK_ONLY_AFTER_SEC = 7.0 * 60.0
 
 DESTINATION_ALIASES = {
     'left_storage': [
@@ -231,6 +365,10 @@ def _load_package_yaml(filename):
         from ament_index_python.packages import get_package_share_directory
 
         config_path = os.path.join(get_package_share_directory('team_1'), 'config', filename)
+        if not os.path.exists(config_path):
+            config_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), '..', 'config', filename)
+            )
         if not os.path.exists(config_path):
             return {}
         with open(config_path, 'r', encoding='utf-8') as stream:
@@ -258,6 +396,23 @@ def _apply_target_config():
 
 def _apply_motion_config():
     motion = _load_package_yaml('motion.yaml')
+    profile_config = motion.get('motion_profile', {})
+    if isinstance(profile_config, dict):
+        mode = str(profile_config.get('mode', 'competition') or 'competition')
+        mode_values = profile_config.get(mode, {})
+        if isinstance(mode_values, dict):
+            for name, values in mode_values.items():
+                if not isinstance(values, dict):
+                    continue
+                key = str(name).strip().lower().replace(' ', '_')
+                current = dict(OBJECT_GRASP_PROFILES.get(key, {}))
+                for field in ('velocity_scale', 'acceleration_scale'):
+                    if field in values:
+                        try:
+                            current[field] = float(values[field])
+                        except (TypeError, ValueError):
+                            pass
+                OBJECT_GRASP_PROFILES[key] = current
     object_pick = motion.get('object_pick', {})
     if isinstance(object_pick, dict):
         for name, values in object_pick.items():
@@ -265,7 +420,68 @@ def _apply_motion_config():
                 current = dict(OBJECT_PICK_OVERRIDES.get(name, {}))
                 _deep_update(current, values)
                 OBJECT_PICK_OVERRIDES[name] = current
+    gripper = motion.get('gripper', {})
+    if isinstance(gripper, dict):
+        for name, values in gripper.items():
+            if not isinstance(values, dict):
+                continue
+            if 'close_pos' in values:
+                try:
+                    GRIPPER_CLOSE_POSITIONS[name] = float(values['close_pos'])
+                except (TypeError, ValueError):
+                    pass
+            if 'close_timeout' in values:
+                current = dict(OBJECT_PICK_OVERRIDES.get(name, {}))
+                try:
+                    current['close_timeout'] = float(values['close_timeout'])
+                    OBJECT_PICK_OVERRIDES[name] = current
+                except (TypeError, ValueError):
+                    pass
+
+
+def _apply_grasp_profile_config():
+    grasp = _load_package_yaml('grasp.yaml')
+    profiles = grasp.get('object_grasp_profiles', {})
+    if not isinstance(profiles, dict):
+        return
+    for name, values in profiles.items():
+        if not isinstance(values, dict):
+            continue
+        key = str(name).strip().lower().replace(' ', '_')
+        current = dict(OBJECT_GRASP_PROFILES.get(key, {}))
+        _deep_update(current, values)
+        OBJECT_GRASP_PROFILES[key] = current
+
+        if 'close_pos' in current:
+            try:
+                GRIPPER_CLOSE_POSITIONS[key] = float(current['close_pos'])
+            except (TypeError, ValueError):
+                pass
+
+        pick_override = dict(OBJECT_PICK_OVERRIDES.get(key, {}))
+        for field in (
+            'approach_height',
+            'lift_height',
+            'grasp_z_offset',
+            'vision_grasp_z_offset',
+            'vision_grasp_z_min',
+            'vision_grasp_z_max',
+            'close_timeout',
+            'approach_duration',
+            'descent_duration',
+            'lift_duration',
+            'post_close_sleep',
+            'close_force',
+            'use_vision_grasp_orientation',
+            'velocity_scale',
+            'acceleration_scale',
+        ):
+            if field in current:
+                pick_override[field] = current[field]
+        if pick_override:
+            OBJECT_PICK_OVERRIDES[key] = pick_override
 
 
 _apply_target_config()
 _apply_motion_config()
+_apply_grasp_profile_config()

@@ -4,6 +4,30 @@ tool_frame: "robotiq_85_base_link"
 move_duration: 4.0
 startup_wait_timeout: 30.0
 
+motion_profile:
+  mode: "competition"
+  competition:
+    meat_can:
+      velocity_scale: 0.75
+      acceleration_scale: 0.75
+    coke_can:
+      velocity_scale: 0.75
+      acceleration_scale: 0.75
+    strawberry:
+      velocity_scale: 0.70
+      acceleration_scale: 0.70
+    banana:
+      velocity_scale: 0.55
+      acceleration_scale: 0.55
+    hammer:
+      velocity_scale: 0.50
+      acceleration_scale: 0.50
+
+startup:
+  move_to_observe_before_first_task: true
+  observe_duration: 3.0
+  open_gripper_on_start: true
+
 pick:
   approach_height: 0.12
   lift_height: 0.18
@@ -11,21 +35,60 @@ pick:
   retry_vision_attempts: 3
 
 object_pick:
+  meat_can:
+    approach_duration: 2.3
+    descent_duration: 1.8
+    lift_duration: 2.2
+    close_timeout: 2.5
+  coke_can:
+    approach_duration: 2.3
+    descent_duration: 1.8
+    lift_duration: 2.2
+    close_timeout: 2.5
+  strawberry:
+    approach_duration: 2.4
+    descent_duration: 1.8
+    lift_duration: 2.2
+    close_timeout: 2.5
+    approach_height: 0.10
+    lift_height: 0.14
+    grasp_z_offset: -0.006
   banana:
     approach_height: 0.16
     lift_height: 0.28
     grasp_z_offset: -0.010
-    approach_duration: 2.0
-    descent_duration: 1.6
-    lift_duration: 2.0
+    approach_duration: 3.0
+    descent_duration: 2.4
+    lift_duration: 3.0
+    close_timeout: 3.5
     post_close_sleep: 0.35
+    use_vision_grasp_orientation: true
   hammer:
-    approach_height: 0.17
-    lift_height: 0.32
-    grasp_z_offset: -0.010
-    approach_duration: 2.1
-    descent_duration: 1.7
-    lift_duration: 2.2
+    approach_height: 0.16
+    lift_height: 0.22
+    grasp_z_offset: -0.012
+    approach_duration: 3.2
+    descent_duration: 2.8
+    lift_duration: 3.2
+    close_timeout: 3.0
     post_close_sleep: 0.35
+    use_vision_grasp_orientation: true
+
+gripper:
+  coke_can:
+    close_pos: 0.42
+    close_timeout: 2.5
+  meat_can:
+    close_pos: 0.38
+    close_timeout: 2.5
+  strawberry:
+    close_pos: 0.70
+    close_timeout: 2.5
+  banana:
+    close_pos: 0.90
+    close_timeout: 3.5
+  hammer:
+    close_pos: 0.75
+    close_timeout: 3.0
 
 dry_run_motion: false

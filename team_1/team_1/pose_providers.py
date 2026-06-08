@@ -67,18 +67,18 @@ class GroundTruthPoseProvider(PoseProvider):
             and not self.client.wait_for_service(timeout_sec=1.0)
             and time.monotonic() < deadline
         ):
-            self.node.get_logger().info('Waiting for /get_object_pose service...')
+            self.node.get_logger().info('Waiting for debug object-pose service...')
             rclpy.spin_once(self.node, timeout_sec=0.1)
         if not self.client.service_is_ready():
             self.node.get_logger().warn(
-                '/get_object_pose was not ready before startup timeout. '
+                'Debug object-pose service was not ready before startup timeout. '
                 'Ground-truth debug requests may fail.'
             )
 
     def get_object_pose(self, object_name):
         self.latest_pose_is_grasp = False
         self.node.get_logger().warn(
-            'Using /get_object_pose debug fallback. Do not use this mode in competition.'
+            'Using ground-truth debug fallback. Do not use this mode in competition.'
         )
         request = StringPose.Request()
         request.data = object_name
@@ -274,7 +274,7 @@ class VisionPoseProvider(PoseProvider):
         self.latest_pose_is_grasp = False
         prompt_name = object_name.replace('_', ' ')
         response_pose = None
-        max_attempts = 3
+        max_attempts = 1 if object_name in {'meat_can', 'coke_can', 'strawberry'} else 2
 
         for attempt in range(1, max_attempts + 1):
             request = StringPose.Request()

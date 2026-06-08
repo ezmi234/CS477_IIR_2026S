@@ -26,6 +26,7 @@ def evaluate_fn(context, *args, **kwargs):
     hardware_interface = LaunchConfiguration('hardware_interface')
     camera_enabled     = LaunchConfiguration('camera_enabled')
     z_offset           = LaunchConfiguration('z_offset')
+    headless           = LaunchConfiguration('headless')
     
     # ***** ROBOT DESCRIPTION ***** #
     # UR5 ROBOT Description file package:
@@ -75,22 +76,7 @@ def evaluate_fn(context, *args, **kwargs):
         parameters=[robot_description]
     )
 
-    # Selection of GUI
-    print("- GUI:")
-    error = True
-    while (error == True):
-        print("     + Option N1: GUI - Gazebo.")
-        print("     + Option N2: Headless - GZSERVER.")
-        gz_flag = input ("  Please type and enter the option number(1 or 2): ")
-        if (gz_flag == "1"):
-            error = False
-            gz_flag = False
-        elif (gz_flag == "2"):
-            error = False
-            gz_flag = True
-        else:
-            print ("  Please select a valid option!")
-    print("")
+    gz_flag = str(headless.perform(context)).strip().lower() in {'1', 'true', 'yes', 'on'}
 
     # ***** RETURN LAUNCH DESCRIPTION ***** #
     if gz_flag:
@@ -131,20 +117,14 @@ def generate_launch_description():
                                               default_value='false')
     z_offset_arg = DeclareLaunchArgument('z_offset',
                                          default_value='0.0')
+    headless_arg = DeclareLaunchArgument(
+        'headless',
+        default_value='false',
+        description='Run Gazebo headless with gzserver instead of GUI.',
+    )
 
     # ========== COMMAND LINE ARGUMENTS ========== #
-    print("- Controller:")
-    while True:
-        print("     + Option N1: Position Controller.")
-        print("     + Option N2: Effort Controller.")
-        flag = input ("  Please type and enter the option number(1 or 2): ")
-        if (flag == "1"):
-            hardware_interface = "PositionJointInterface"
-            break
-        elif (flag == "2"):
-            hardware_interface = "EffortJointInterface"
-            break
-        print ("  Please select a valid option!")
+    hardware_interface = "PositionJointInterface"
     print("Selected hardware interface is {}".format(hardware_interface))
     
     hardware_interface_arg = DeclareLaunchArgument('hardware_interface',
@@ -185,6 +165,7 @@ def generate_launch_description():
         hardware_interface_arg,
         camera_enabled_arg,
         z_offset_arg,
+        headless_arg,
         load_ur5_controller,
         load_gripper_controller,
         load_joint_state_broadcaster,

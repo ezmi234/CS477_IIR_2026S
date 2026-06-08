@@ -30,6 +30,9 @@ class DepthColorProposalBackend:
     def __init__(self, min_area: int = 250):
         self.min_area = int(min_area)
 
+    def warmup(self):
+        return False
+
     def detect(self, image_bgr: np.ndarray, cloud_msg, target_label: str, camera_name: str) -> list[Detection]:
         xyz = pointcloud2_to_xyz_image(cloud_msg)
         if image_bgr is None or xyz is None:
@@ -139,6 +142,19 @@ class OwlVitBackend:
         self.model.eval()
         self._loaded = True
 
+    def warmup(self):
+        self._load()
+        import numpy as np
+
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+        pil = self.PILImage.fromarray(image)
+        inputs = self.processor(text=[["coke can"]], images=pil, return_tensors="pt")
+        if self.device == "cuda":
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        with self.torch.no_grad():
+            self.model(**inputs)
+        return True
+
     def detect(self, image_bgr: np.ndarray, cloud_msg, target_label: str, camera_name: str) -> list[Detection]:
         try:
             self._load()
@@ -246,6 +262,7 @@ def _nms_detections(detections: list[Detection], iou_threshold: float = 0.55, li
 
 def make_backend(name: str, params: dict):
     name = str(name).strip()
+    logger = params.get("logger")
     if name == "depth":
         return DepthColorProposalBackend(min_area=params.get("depth_min_area", 250))
     if name == "hf_owlvit":
@@ -256,5 +273,23 @@ def make_backend(name: str, params: dict):
         )
     if name == "yolo":
         from .yolo_backend import YoloBackend
-        return YoloBackend(model_path=params.get("yolo_model_path", ""), conf=params.get("yolo_conf", 0.15))
+        return YoloBackend(
+            model_path=params.get("yolo_model_path", ""),
+            conf=params.get("yolo_conf", 0.15),
+            device=params.get("yolo_device", "cpu"),
+            logger=logger,
+        )
+    if name == "grounding_dino":
+        from .grounding_dino_backend import GroundingDinoBackend
+        return GroundingDinoBackend(
+            enabled=params.get("grounding_dino_enabled", False),
+            model_id=params.get("grounding_dino_model_id", "IDEA-Research/grounding-dino-base"),
+            text_prompt=params.get(
+                "grounding_dino_text_prompt",
+                "coke can. meat can. banana. hammer. strawberry.",
+            ),
+            box_threshold=params.get("grounding_dino_box_threshold", 0.25),
+            text_threshold=params.get("grounding_dino_text_threshold", 0.20),
+            device=params.get("grounding_dino_device", "auto"),
+        )
     return None

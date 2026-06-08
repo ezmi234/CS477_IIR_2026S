@@ -72,23 +72,36 @@ DEFAULT_GRASP_CONFIG = {
         "use_largest_cluster": False,
     },
     "coke_can": {
-        "strategy": "center_top",
+        "strategy": "can_side_or_top_center",
         "prefer_center_top": True,
-        "candidate_yaw_offsets": [0.0],
+        "candidate_yaw_offsets": [0.0, 1.5708],
+        "rim_guard_fraction": 0.22,
+        "upper_body_percentile": 18.0,
+        "max_gripper_width": 0.075,
         "surface_depth_offset": 0.0,
     },
     "meat_can": {
-        "strategy": "center_top",
+        "strategy": "can_side_or_top_center",
         "prefer_center_top": True,
-        "candidate_yaw_offsets": [0.0],
+        "candidate_yaw_offsets": [0.0, 1.5708],
+        "rim_guard_fraction": 0.22,
+        "upper_body_percentile": 18.0,
+        "max_gripper_width": 0.075,
         "surface_depth_offset": 0.0,
     },
     "strawberry": {
-        "strategy": "center_top",
+        "strategy": "compact_top_center",
         "prefer_center_top": True,
         "candidate_yaw_offsets": [0.0],
         "surface_depth_offset": 0.0,
         "min_points": 25,
+        "max_expected_width": 0.075,
+        "max_expected_length": 0.085,
+        "can_like_min_height": 0.060,
+        "red_hsv_lower_1": [0, 45, 35],
+        "red_hsv_upper_1": [12, 255, 255],
+        "red_hsv_lower_2": [165, 45, 35],
+        "red_hsv_upper_2": [180, 255, 255],
     },
 }
 
@@ -249,6 +262,10 @@ def estimate_grasp_candidates(image_bgr, cloud_msg, detection: dict[str, Any], c
         specs = _elongated_pca_specs(pts, geometry, settings)
     elif strategy == "handle_grasp":
         specs = _handle_grasp_specs(pts, geometry, settings)
+    elif strategy == "can_side_or_top_center":
+        specs = _can_side_or_top_center_specs(pts, geometry, settings)
+    elif strategy == "compact_top_center":
+        specs = _compact_top_center_specs(image_bgr, bbox, pts, geometry, settings)
     else:
         specs = _center_top_specs(pts, geometry, settings)
     if not specs:
@@ -847,6 +864,74 @@ def _mask_contours_uv(mask: np.ndarray, x_offset: int, y_offset: int, cv2) -> li
     return out
 
 
+def _red_compactness_debug(image_bgr, bbox: tuple[int, int, int, int], settings: dict[str, Any]) -> dict[str, Any]:
+    try:
+        import cv2
+    except Exception:
+        return {
+            "red_mask_area": 0,
+            "compactness": 0.0,
+            "red_mask_source": "opencv_unavailable",
+        }
+    if image_bgr is None:
+        return {
+            "red_mask_area": 0,
+            "compactness": 0.0,
+            "red_mask_source": "no_image",
+        }
+
+    x1, y1, x2, y2 = bbox
+    image = np.asarray(image_bgr)
+    if image.ndim != 3 or image.shape[0] < y2 or image.shape[1] < x2:
+        return {
+            "red_mask_area": 0,
+            "compactness": 0.0,
+            "red_mask_source": "image_bbox_mismatch",
+        }
+    crop = image[y1:y2, x1:x2, :3]
+    if crop.size == 0:
+        return {
+            "red_mask_area": 0,
+            "compactness": 0.0,
+            "red_mask_source": "empty_bbox",
+        }
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    lower1 = np.asarray(settings.get("red_hsv_lower_1", [0, 45, 35]), dtype=np.uint8)
+    upper1 = np.asarray(settings.get("red_hsv_upper_1", [12, 255, 255]), dtype=np.uint8)
+    lower2 = np.asarray(settings.get("red_hsv_lower_2", [165, 45, 35]), dtype=np.uint8)
+    upper2 = np.asarray(settings.get("red_hsv_upper_2", [180, 255, 255]), dtype=np.uint8)
+    mask = (cv2.inRange(hsv, lower1, upper1) > 0) | (cv2.inRange(hsv, lower2, upper2) > 0)
+    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8)).astype(bool)
+    area = int(mask.sum())
+    if area <= 0:
+        return {
+            "red_mask_area": 0,
+            "compactness": 0.0,
+            "red_mask_source": "red_hsv_empty",
+        }
+
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return {
+            "red_mask_area": area,
+            "compactness": 0.0,
+            "red_mask_source": "red_hsv_no_contour",
+        }
+    contour = max(contours, key=cv2.contourArea)
+    contour_area = float(max(cv2.contourArea(contour), 0.0))
+    perimeter = float(cv2.arcLength(contour, True))
+    compactness = 0.0 if perimeter <= 1e-6 else float(4.0 * math.pi * contour_area / (perimeter * perimeter))
+    x, y, w, h = cv2.boundingRect(contour)
+    return {
+        "red_mask_area": area,
+        "red_largest_component_area": contour_area,
+        "compactness": max(0.0, min(1.0, compactness)),
+        "red_component_bbox_uv": [int(x + x1), int(y + y1), int(x + w + x1), int(y + h + y1)],
+        "red_mask_source": "red_hsv",
+    }
+
+
 def _settings_for_label(label: str, config: dict[str, Any]) -> dict[str, Any]:
     settings = dict(config.get("default", {}))
     settings.update(config.get(_label_key(label), {}))
@@ -977,6 +1062,120 @@ def _center_top_specs(pts: np.ndarray, geometry: dict[str, Any], settings: dict[
     } for yaw in yaws]
 
 
+def _can_side_or_top_center_specs(pts: np.ndarray, geometry: dict[str, Any], settings: dict[str, Any]) -> list[dict[str, Any]]:
+    pts = _finite_points(pts)
+    if pts.shape[0] < 12:
+        return []
+
+    center_xy = np.nanmedian(pts[:, :2], axis=0)
+    z_values = pts[:, 2]
+    z_surface = float(np.nanpercentile(z_values, float(settings.get("upper_body_percentile", 18.0))))
+    z_low = float(np.nanpercentile(z_values, 5.0))
+    z_high = float(np.nanpercentile(z_values, 95.0))
+    height = max(0.0, z_high - z_low)
+    rim_guard = max(0.004, height * float(settings.get("rim_guard_fraction", 0.22)))
+    selected_z = min(max(z_surface + 0.5 * rim_guard, z_low + rim_guard), z_high - 0.25 * rim_guard)
+    point = np.array([
+        float(center_xy[0]),
+        float(center_xy[1]),
+        float(selected_z + float(settings.get("surface_depth_offset", 0.0))),
+    ], dtype=float)
+
+    yaws = _yaw_values(float(geometry["pca_yaw"]), settings, default=[0.0, math.pi / 2.0])
+    radius_est = 0.5 * max(float(geometry["width"]), min(float(geometry["length"]), float(geometry["width"])))
+    specs: list[dict[str, Any]] = []
+    for yaw in yaws:
+        width = _estimated_width_for_yaw(
+            pts,
+            point[:2],
+            yaw,
+            local_radius=max(0.040, min(0.085, float(geometry["length"]) * 0.35)),
+        )
+        if width <= 1e-6:
+            width = min(float(settings.get("max_gripper_width", 0.075)), max(0.045, float(geometry["width"])))
+        specs.append({
+            "method": "can_side_or_top_center",
+            "point": point.copy(),
+            "yaw": yaw,
+            "estimated_width": width,
+            "bonus": 0.12,
+            "debug": {
+                "strategy": "can_side_or_top_center",
+                "local_affordance_method": "robust_upper_body_center",
+                "estimated_radius": float(radius_est),
+                "estimated_width": float(width),
+                "estimated_height": float(height),
+                "selected_center_point": [float(v) for v in point.tolist()],
+                "selected_grasp_z": float(point[2]),
+                "rim_guard_m": float(rim_guard),
+                "z_low": float(z_low),
+                "z_high": float(z_high),
+                "yaw_mode": "symmetric_default",
+                "reason": "selected upper-middle can body center, away from rim/table",
+            },
+        })
+    return specs
+
+
+def _compact_top_center_specs(
+    image_bgr,
+    bbox: tuple[int, int, int, int],
+    pts: np.ndarray,
+    geometry: dict[str, Any],
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    pts = _finite_points(pts)
+    if pts.shape[0] < 8:
+        return []
+
+    red_debug = _red_compactness_debug(image_bgr, bbox, settings)
+    length = float(geometry["length"])
+    width = float(geometry["width"])
+    height = float(geometry["depth_span"])
+    can_like = (
+        height >= float(settings.get("can_like_min_height", 0.060))
+        and max(length, width) > float(settings.get("max_expected_length", 0.085)) * 1.25
+    )
+
+    center_xy = np.nanmedian(pts[:, :2], axis=0)
+    point = np.array([
+        float(center_xy[0]),
+        float(center_xy[1]),
+        float(geometry["surface_z"] + float(settings.get("surface_depth_offset", 0.0))),
+    ], dtype=float)
+    yaws = _yaw_values(float(geometry["pca_yaw"]), settings, default=[0.0])
+    compactness = float(red_debug.get("compactness", 0.0))
+    red_area = int(red_debug.get("red_mask_area", 0))
+    size_penalty = 0.18 if can_like else 0.0
+    bonus = max(0.02, 0.12 + 0.08 * min(1.0, compactness) - size_penalty)
+
+    return [{
+        "method": "compact_top_center",
+        "point": point.copy(),
+        "yaw": yaw,
+        "estimated_width": min(0.055, max(0.025, width)),
+        "bonus": bonus,
+        "debug": {
+            "strategy": "compact_top_center",
+            "local_affordance_method": "compact_red_top_center",
+            "red_mask_area": red_area,
+            "compactness": compactness,
+            "estimated_size": {
+                "width": width,
+                "length": length,
+                "height_depth": height,
+            },
+            "selected_center_point": [float(v) for v in point.tolist()],
+            "selected_grasp_z": float(point[2]),
+            "reject_reason": "can_like_dimensions" if can_like else None,
+            "can_like_dimension_check": bool(can_like),
+            "yaw_mode": "symmetric_default",
+            "reason": "selected compact top-center body point",
+            **red_debug,
+        },
+    } for yaw in yaws]
+
+
 def _elongated_pca_specs(pts: np.ndarray, geometry: dict[str, Any], settings: dict[str, Any]) -> list[dict[str, Any]]:
     specs = _local_axis_band_specs(pts, geometry, settings, label_kind="elongated_pca")
     if specs:
@@ -1091,10 +1290,14 @@ def _local_axis_band_specs(pts: np.ndarray, geometry: dict[str, Any], settings: 
                     "strategy": method,
                     "local_affordance_method": "local_axis_band",
                     "selected_band": {k: float(v) if isinstance(v, (int, float, np.floating)) else v for k, v in band.items() if k != "mask"},
+                    "selected_handle_segment": {k: float(v) if isinstance(v, (int, float, np.floating)) else v for k, v in band.items() if k != "mask"} if label_kind == "handle_grasp" else None,
                     "axis_offset_m": float(band["center_s"]),
                     "axis_fraction": axis_fraction,
                     "local_width": float(band["width"]),
+                    "head_handle_separation_estimate": float(max(0.0, geometry.get("width", 0.0) - band["width"])) if label_kind == "handle_grasp" else None,
+                    "yaw_candidates": [float(value) for value in yaw_values],
                     "hammer_segment_kind": band["kind"] if label_kind == "handle_grasp" else None,
+                    "skip_reason": None if label_kind != "handle_grasp" or band["kind"] == "handle" else "selected segment may be bulky head",
                 },
             })
     return specs

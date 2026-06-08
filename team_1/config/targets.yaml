@@ -10,11 +10,13 @@ left_storage:
   use_grasp_orientation: true
   approach_z: 0.15
   retreat_z: 0.20
-  approach_duration: 1.5
-  release_duration: 1.0
+  approach_duration: 2.8
+  release_duration: 2.0
   open_timeout: 2.5
   post_release_sleep: 0.8
-  retreat_duration: 1.0
+  retreat_duration: 3.0
+  return_home_after_place: true
+  return_home_duration: 4.0
 
 right_storage:
   frame_id: "base_link"
@@ -28,11 +30,13 @@ right_storage:
   use_grasp_orientation: true
   approach_z: 0.15
   retreat_z: 0.20
-  approach_duration: 1.5
-  release_duration: 1.0
+  approach_duration: 2.8
+  release_duration: 2.0
   open_timeout: 2.5
   post_release_sleep: 0.8
-  retreat_duration: 1.0
+  retreat_duration: 3.0
+  return_home_after_place: true
+  return_home_duration: 4.0
 
 shelf:
   frame_id: "base_link"
@@ -43,8 +47,10 @@ shelf:
   approach_x_offset: -0.16
   retreat_x_offset: -0.28
   retreat_lift_z: 0.02
-  approach_duration: 1.7
-  release_duration: 1.2
+  approach_duration: 2.8
+  release_duration: 2.0
   open_timeout: 2.5
   post_release_sleep: 0.8
-  retreat_duration: 2.0
+  retreat_duration: 3.0
+  return_home_after_place: true
+  return_home_duration: 4.0

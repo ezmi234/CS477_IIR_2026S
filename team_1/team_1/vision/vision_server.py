@@ -12,9 +12,12 @@ Runtime rule:
 from __future__ import annotations
 
 import json
+import math
 import os
+import time
 from typing import Any
 
+import numpy as np
 from ament_index_python.packages import get_package_share_directory
 import rclpy
 import rclpy.duration
@@ -35,6 +38,7 @@ except Exception:
 
 from riro_srvs.srv import StringPose
 
+from ..config import MIN_FINAL_CANDIDATE_SCORE, OBJECT_RISK
 from .backends import make_backend
 from .grasp_estimator import (
     DEFAULT_GRASP_CONFIG,
@@ -42,8 +46,13 @@ from .grasp_estimator import (
     fallback_grasp_candidates,
 )
 from .labels import canonical_aliases_for_log, extract_target_label, normalize_label
+from .object_verifier import verify_candidate
+from .pointcloud import pointcloud2_to_xyz_image, valid_xyz_mask
 from .types import CameraState, Detection
 from .visualization import draw_detections
+
+
+DEFAULT_YOLO_MODEL_PATH = "/home/ubuntu/cs477_ws/src/cs477_IIR/team_1/models/yolo_five_objects_best.pt"
 
 
 def stamp_to_sec(stamp) -> float:
@@ -171,8 +180,33 @@ class VisionServer(Node):
         self.declare_parameter("backend_order", ["depth"])
         self.declare_parameter("vision_backend", "")
         self.declare_parameter("future_backend_order", ["yolo", "hf_owlvit"])
-        self.declare_parameter("yolo_model_path", "")
-        self.declare_parameter("yolo_conf", 0.15)
+        self.declare_parameter("allow_backend_fallback", True)
+        self.declare_parameter("backend_debug", True)
+        self.declare_parameter("save_debug_images", False)
+        self.declare_parameter("debug_dir", "/home/ubuntu/cs477_ws/debug_runs/vision_debug")
+        self.declare_parameter("warmup_on_start", True)
+        self.declare_parameter("top_camera_min_final_score", 0.55)
+        self.declare_parameter("tf_exact_timeout_sec", 0.08)
+        self.declare_parameter("tf_latest_timeout_sec", 0.06)
+        self.declare_parameter("tf_candidate_budget_sec", 0.30)
+        self.declare_parameter("ranking_request_budget_sec", 1.0)
+        self.declare_parameter("yolo_enabled", False)
+        self.declare_parameter("yolo_model_path", DEFAULT_YOLO_MODEL_PATH)
+        self.declare_parameter("yolo_conf", 0.25)
+        self.declare_parameter("yolo_device", "auto")
+        self.declare_parameter("yolo.enabled", False)
+        self.declare_parameter("yolo.model_path", DEFAULT_YOLO_MODEL_PATH)
+        self.declare_parameter("yolo.confidence_threshold", 0.25)
+        self.declare_parameter("yolo.device", "auto")
+        self.declare_parameter("grounding_dino_enabled", False)
+        self.declare_parameter("grounding_dino_model_id", "IDEA-Research/grounding-dino-base")
+        self.declare_parameter(
+            "grounding_dino_text_prompt",
+            "coke can. meat can. banana. hammer. strawberry.",
+        )
+        self.declare_parameter("grounding_dino_box_threshold", 0.25)
+        self.declare_parameter("grounding_dino_text_threshold", 0.20)
+        self.declare_parameter("grounding_dino_device", "auto")
         self.declare_parameter("grasp_config_file", "grasp.yaml")
         self.declare_parameter("min_return_score", 0.03)
         self.declare_parameter("device", "cpu")
@@ -200,7 +234,16 @@ class VisionServer(Node):
         )
         self.max_camera_age_sec = float(self.get_parameter("max_camera_age_sec").value)
         self.min_return_score = float(self.get_parameter("min_return_score").value)
+        self.top_camera_min_final_score = float(self.get_parameter("top_camera_min_final_score").value)
+        self.tf_exact_timeout_sec = min(0.10, max(0.0, float(self.get_parameter("tf_exact_timeout_sec").value)))
+        self.tf_latest_timeout_sec = min(0.10, max(0.0, float(self.get_parameter("tf_latest_timeout_sec").value)))
+        self.tf_candidate_budget_sec = min(0.30, max(0.05, float(self.get_parameter("tf_candidate_budget_sec").value)))
+        self.ranking_request_budget_sec = min(1.0, max(0.10, float(self.get_parameter("ranking_request_budget_sec").value)))
         self.debug = bool(self.get_parameter("debug").value)
+        self.backend_debug = bool(self.get_parameter("backend_debug").value)
+        self.allow_backend_fallback = bool(self.get_parameter("allow_backend_fallback").value)
+        self.save_debug_images = bool(self.get_parameter("save_debug_images").value)
+        self.debug_dir = str(self.get_parameter("debug_dir").value)
         self.base_frame = str(self.get_parameter("base_frame").value)
 
         self.bridge = CvBridge()
@@ -221,12 +264,31 @@ class VisionServer(Node):
             self.get_logger().info(f"Subscribed camera '{name}': rgb={rgb_topic}, cloud={cloud_topic}")
 
         params = {
+            "logger": self.get_logger(),
             "device": str(self.get_parameter("device").value),
             "hf_model_id": str(self.get_parameter("hf_model_id").value),
             "hf_score_threshold": float(self.get_parameter("hf_score_threshold").value),
             "depth_min_area": int(self.get_parameter("depth_min_area").value),
-            "yolo_model_path": str(self.get_parameter("yolo_model_path").value),
-            "yolo_conf": float(self.get_parameter("yolo_conf").value),
+            "yolo_enabled": bool(self.get_parameter("yolo_enabled").value)
+            or bool(self.get_parameter("yolo.enabled").value),
+            "yolo_model_path": str(
+                self.get_parameter("yolo_model_path").value
+                or self.get_parameter("yolo.model_path").value
+            ),
+            "yolo_conf": float(
+                self.get_parameter("yolo_conf").value
+                or self.get_parameter("yolo.confidence_threshold").value
+            ),
+            "yolo_device": str(
+                self.get_parameter("yolo_device").value
+                or self.get_parameter("yolo.device").value
+            ),
+            "grounding_dino_enabled": bool(self.get_parameter("grounding_dino_enabled").value),
+            "grounding_dino_model_id": str(self.get_parameter("grounding_dino_model_id").value),
+            "grounding_dino_text_prompt": str(self.get_parameter("grounding_dino_text_prompt").value),
+            "grounding_dino_box_threshold": float(self.get_parameter("grounding_dino_box_threshold").value),
+            "grounding_dino_text_threshold": float(self.get_parameter("grounding_dino_text_threshold").value),
+            "grounding_dino_device": str(self.get_parameter("grounding_dino_device").value),
         }
         backend_value = self.get_parameter("backend_order").value
         if isinstance(backend_value, str):
@@ -236,13 +298,46 @@ class VisionServer(Node):
         vision_backend = str(self.get_parameter("vision_backend").value or "").strip()
         if vision_backend:
             backend_order = [vision_backend]
-        if "yolo" in backend_order and "hf_owlvit" not in backend_order:
-            backend_order.append("hf_owlvit")
+        if vision_backend == "yolo":
+            params["yolo_enabled"] = True
+        backend_order = [name for name in backend_order if name]
+        if not self.allow_backend_fallback and len(backend_order) > 1:
+            self.get_logger().warn(
+                f"allow_backend_fallback=false; using only first configured backend={backend_order[0]!r} "
+                f"from backend_order={backend_order}"
+            )
+            backend_order = backend_order[:1]
+        if backend_order == ["yolo"]:
+            self.get_logger().info("YOLO-only backend_order active; hf_owlvit will not be used.")
+        self.get_logger().info(
+            "Vision backend configuration: "
+            f"backend_order={backend_order}, yolo_enabled={params.get('yolo_enabled')}, "
+            f"yolo_model_path={params.get('yolo_model_path')!r}, "
+            f"yolo_conf={params.get('yolo_conf')}, yolo_device={params.get('yolo_device')!r}, "
+            f"allow_backend_fallback={self.allow_backend_fallback}, backend_debug={self.backend_debug}"
+        )
         self.backends = []
+        self.backend_order_names = []
         for name in backend_order:
+            if name == "yolo" and not params.get("yolo_enabled", False):
+                self.get_logger().warn("YOLO disabled by config; using configured fallback backends.")
+                continue
             backend = make_backend(name, params)
             if backend is not None:
                 self.backends.append(backend)
+                self.backend_order_names.append(backend.name)
+                if name == "yolo" and hasattr(backend, "diagnostics"):
+                    try:
+                        self.get_logger().info(
+                            "YOLO backend diagnostics at construction: "
+                            + json.dumps(backend.diagnostics(), sort_keys=True)
+                        )
+                    except Exception as exc:
+                        self.get_logger().warn(f"Could not read YOLO diagnostics: {exc}")
+            else:
+                self.get_logger().warn(f"Unknown or unavailable vision backend name={name!r}.")
+        if bool(self.get_parameter("warmup_on_start").value):
+            self.warmup_backends()
 
         self.srv = self.create_service(StringPose, self.service_name, self.detect_callback)
 
@@ -253,6 +348,7 @@ class VisionServer(Node):
         self.selected_grasp_base_pub = self.create_publisher(PoseStamped, "/vision/selected_grasp_base", 10)
         self.grasp_candidates_pub = self.create_publisher(String, "/vision/grasp_candidates", 10)
         self.grasp_debug_pub = self.create_publisher(String, "/vision/grasp_debug", 10)
+        self.candidate_ranking_pub = self.create_publisher(String, "/vision/candidate_ranking", 10)
         self.debug_image_pub = self.create_publisher(Image, "/vision/debug_image", 10)
 
         self.status_timer = self.create_timer(2.0, self.log_camera_status)
@@ -262,6 +358,22 @@ class VisionServer(Node):
             f"backend_order={[b.name for b in self.backends]}, "
             f"preferred_camera={self.preferred_camera}, camera_selection_mode={self.camera_selection_mode}"
         )
+
+    def warmup_backends(self):
+        for backend in self.backends:
+            started = time.monotonic()
+            try:
+                warmed = bool(getattr(backend, "warmup", lambda: False)())
+                elapsed = time.monotonic() - started
+                self.get_logger().info(
+                    f"Vision backend warmup: backend={backend.name}, warmed={warmed}, warmup_time={elapsed:.3f}s"
+                )
+            except Exception as exc:
+                elapsed = time.monotonic() - started
+                self.get_logger().warn(
+                    f"Vision backend warmup failed: backend={getattr(backend, 'name', 'unknown')}, "
+                    f"warmup_time={elapsed:.3f}s, error={exc}"
+                )
 
     def load_grasp_config(self):
         config = dict(DEFAULT_GRASP_CONFIG)
@@ -386,7 +498,664 @@ class VisionServer(Node):
             )
         return stamped, info
 
+    def build_candidate_rankings(
+        self,
+        target: str,
+        detections: list[Detection],
+        camera_by_name: dict[str, CameraState],
+    ) -> list[dict[str, Any]]:
+        if not detections:
+            return []
+        xyz_cache: dict[str, Any] = {}
+        rankings: list[dict[str, Any]] = []
+        preferred_camera = self.object_camera_preferences.get(target)
+        ranking_budget_started = time.monotonic()
+        budget_logged = False
+        low_risk_target = OBJECT_RISK.get(target, "medium") == "low"
+
+        for det in detections:
+            if time.monotonic() - ranking_budget_started > self.ranking_request_budget_sec:
+                if not budget_logged:
+                    self.get_logger().warn(
+                        f"Candidate ranking budget exhausted for {target}: "
+                        f"budget={self.ranking_request_budget_sec:.2f}s, ranked={len(rankings)}, "
+                        f"remaining={max(0, len(detections) - len(rankings))}"
+                    )
+                    budget_logged = True
+                break
+            cam = camera_by_name.get(det.camera_name)
+            image = cam.image_bgr if cam is not None else None
+            cloud_msg = cam.cloud_msg if cam is not None else None
+            image_h, image_w = image.shape[:2] if image is not None else (0, 0)
+            det_dict = det.to_dict()
+            det_dict["image_width"] = int(image_w)
+            det_dict["image_height"] = int(image_h)
+
+            xyz = None
+            if cloud_msg is not None:
+                if det.camera_name not in xyz_cache:
+                    xyz_cache[det.camera_name] = pointcloud2_to_xyz_image(cloud_msg)
+                xyz = xyz_cache.get(det.camera_name)
+
+            roi_points = self.roi_points_for_detection(xyz, det.bbox_xyxy)
+            image_crop = self.image_crop_for_detection(image, det.bbox_xyxy)
+            verification = verify_candidate(target, det_dict, roi_points, image_crop)
+            isolation = self.isolation_score(det, detections)
+
+            pose_msg = self.pose_stamped_for_detection(det, cam)
+            tf_started = time.monotonic()
+            center_base, center_transform_mode = (
+                self.transform_pose_stamped_bounded(
+                    pose_msg,
+                    self.base_frame,
+                    candidate_started=time.monotonic(),
+                    camera_name=det.camera_name,
+                )
+                if pose_msg is not None
+                else (None, "rejected_timeout")
+            )
+            self._ranking_tf_time += time.monotonic() - tf_started
+            reachability = self.reachability_score(center_base)
+            edge_score = self.workspace_edge_score(center_base, det.center_xyz)
+
+            grasp_candidates = []
+            selected_grasp = None
+            selected_grasp_base = None
+            grasp_transform_mode = "not_attempted"
+            base_safety_info: dict[str, Any] = {"applied": False}
+            if image is not None and cloud_msg is not None:
+                grasp_started = time.monotonic()
+                grasp_candidates = estimate_grasp_candidates(
+                    image,
+                    cloud_msg,
+                    det_dict,
+                    self.grasp_config,
+                )
+                min_candidate_score = float(
+                    self.grasp_config.get("default", {}).get("min_candidate_score", 0.25)
+                )
+                if not grasp_candidates or grasp_candidates[0].score < min_candidate_score:
+                    fallback = fallback_grasp_candidates(
+                        det_dict,
+                        self.grasp_config,
+                        frame_id=getattr(getattr(cloud_msg, "header", None), "frame_id", ""),
+                        camera_name=det.camera_name,
+                    )
+                    if fallback:
+                        grasp_candidates.extend(fallback)
+                        grasp_candidates.sort(key=lambda c: c.score, reverse=True)
+                self._ranking_grasp_time += time.monotonic() - grasp_started
+                if grasp_candidates:
+                    selected_grasp = grasp_candidates[0]
+                    selected_grasp.pose.header.stamp = cloud_msg.header.stamp
+                    tf_started = time.monotonic()
+                    selected_grasp_base, grasp_transform_mode = self.transform_pose_stamped_bounded(
+                        selected_grasp.pose,
+                        self.base_frame,
+                        candidate_started=time.monotonic(),
+                        camera_name=det.camera_name,
+                    )
+                    self._ranking_tf_time += time.monotonic() - tf_started
+                    selected_grasp_base, base_safety_info = self.apply_base_grasp_safety(
+                        target,
+                        selected_grasp_base,
+                    )
+
+            grasp_score = float(selected_grasp.score) if selected_grasp is not None else 0.0
+            risk_factor = self.risk_factor(target)
+            camera_factor = 1.0
+            if preferred_camera and det.camera_name == preferred_camera:
+                camera_factor = 1.08
+
+            semantic = float(det.effective_score())
+            semantic_for_score = max(semantic, 0.08) if low_risk_target else semantic
+            semantic_quality = min(1.0, max(0.0, semantic_for_score / 0.18))
+            grasp_quality = min(1.0, max(0.0, grasp_score / 0.45))
+            verification_score = max(0.0, min(1.0, float(verification.score_multiplier)))
+            accepted_factor = 1.0 if verification.accepted else 0.08
+            final_score = (
+                semantic_quality
+                * verification_score
+                * accepted_factor
+                * grasp_quality
+                * max(0.0, min(1.0, reachability))
+                * (0.60 + 0.40 * isolation)
+                * (0.70 + 0.30 * edge_score)
+                * risk_factor
+                * camera_factor
+            )
+
+            bbox_area = self.bbox_area(det.bbox_xyxy)
+            point_dims = self.point_dimensions(roi_points)
+            reject_reason = None if verification.accepted else verification.reason
+            if selected_grasp is None:
+                reject_reason = reject_reason or "no_grasp_candidate"
+            if center_base is None:
+                reject_reason = reject_reason or "base_transform_unavailable"
+            if (
+                low_risk_target
+                and det.camera_name == "wrist"
+                and center_transform_mode != "exact"
+            ):
+                reject_reason = reject_reason or "wrist_transform_stale"
+            if reachability <= 0.05:
+                reject_reason = reject_reason or "unreachable_base_pose"
+
+            rankings.append({
+                "detection": det,
+                "camera": cam,
+                "pose_msg": pose_msg,
+                "center_base": center_base,
+                "grasp_candidates": grasp_candidates,
+                "selected_grasp": selected_grasp,
+                "selected_grasp_base": selected_grasp_base,
+                "base_safety_info": base_safety_info,
+                "verification": verification,
+                "final_score": float(final_score),
+                "reject_reason": reject_reason,
+                "metadata": {
+                    "label": det.label,
+                    "score": float(det.score),
+                    "semantic_score": semantic,
+                    "semantic_for_score": float(semantic_for_score),
+                    "semantic_quality_score": float(semantic_quality),
+                    "raw_score": float(det.raw_score),
+                    "rank_score": float(det.effective_score()),
+                    "camera_name": det.camera_name,
+                    "camera": det.camera_name,
+                    "transform_mode": center_transform_mode,
+                    "center_transform_mode": center_transform_mode,
+                    "grasp_transform_mode": grasp_transform_mode,
+                    "backend": det.backend,
+                    "bbox_xyxy": [int(v) for v in det.bbox_xyxy],
+                    "center_xyz": [float(v) for v in det.center_xyz],
+                    "center_base": _pose_stamped_to_dict(center_base),
+                    "base_link_pose_exists": bool(center_base is not None or selected_grasp_base is not None),
+                    "selected_grasp": selected_grasp.to_dict() if selected_grasp is not None else None,
+                    "selected_grasp_base": _pose_stamped_to_dict(selected_grasp_base),
+                    "grasp_score": grasp_score,
+                    "grasp_quality_score": float(grasp_quality),
+                    "verification_score": verification_score,
+                    "bbox_area": int(bbox_area),
+                    "point_count": int(point_dims["point_count"]),
+                    "dimensions": [
+                        float(point_dims.get("width_m", 0.0)),
+                        float(point_dims.get("length_m", 0.0)),
+                        float(point_dims.get("height_m", 0.0)),
+                    ],
+                    "estimated_width": float(
+                        point_dims.get("width_m", 0.0)
+                        or (selected_grasp.width if selected_grasp is not None else 0.0)
+                    ),
+                    "estimated_height": float(point_dims.get("height_m", 0.0)),
+                    "isolation_score": float(isolation),
+                    "isolation": float(isolation),
+                    "reachability_score": float(reachability),
+                    "reachability": float(reachability),
+                    "risk_score": float(risk_factor),
+                    "edge_score": float(edge_score),
+                    "verification": {
+                        "accepted": bool(verification.accepted),
+                        "score_multiplier": float(verification.score_multiplier),
+                        "reason": verification.reason,
+                        "debug": verification.debug,
+                    },
+                    "final_score": float(final_score),
+                    "final_threshold": float(
+                        MIN_FINAL_CANDIDATE_SCORE.get(target, self.min_return_score)
+                    ),
+                    "reject_reason": reject_reason,
+                },
+            })
+
+        rankings.sort(
+            key=lambda item: (
+                item["reject_reason"] is None,
+                float(item["final_score"]),
+            ),
+            reverse=True,
+        )
+        return rankings
+
+    def publish_candidate_ranking(
+        self,
+        target: str,
+        rankings: list[dict[str, Any]],
+        selected_record: dict[str, Any] | None,
+        backend_trace: list[dict[str, Any]] | None = None,
+        backend_decision: dict[str, Any] | None = None,
+    ):
+        payload = self.build_candidate_ranking_payload(
+            target,
+            rankings,
+            selected_record,
+            backend_trace=backend_trace,
+            backend_decision=backend_decision,
+        )
+        self.candidate_ranking_pub.publish(String(data=json.dumps(payload)))
+
+    def build_candidate_ranking_payload(
+        self,
+        target: str,
+        rankings: list[dict[str, Any]],
+        selected_record: dict[str, Any] | None,
+        *,
+        backend_trace: list[dict[str, Any]] | None = None,
+        backend_decision: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        candidates = []
+        selected_index = None
+        backend_groups: dict[str, dict[str, Any]] = {}
+        for index, record in enumerate(rankings):
+            metadata = dict(record.get("metadata", {}))
+            if selected_record is record:
+                selected_index = index
+            candidates.append(metadata)
+            backend_name = str(metadata.get("backend", "unknown"))
+            group = backend_groups.setdefault(
+                backend_name,
+                {
+                    "backend": backend_name,
+                    "candidate_count": 0,
+                    "verified_candidate_count": 0,
+                    "rejected_candidate_count": 0,
+                    "valid_depth_count": 0,
+                    "valid_tf_count": 0,
+                    "best_candidate_score": None,
+                    "reject_reasons": {},
+                    "candidates": [],
+                },
+            )
+            group["candidate_count"] += 1
+            reject_reason = metadata.get("reject_reason")
+            if reject_reason is None:
+                group["verified_candidate_count"] += 1
+            else:
+                group["rejected_candidate_count"] += 1
+                reasons = dict(group["reject_reasons"])
+                reasons[str(reject_reason)] = int(reasons.get(str(reject_reason), 0)) + 1
+                group["reject_reasons"] = reasons
+            if int(metadata.get("point_count", 0) or 0) > 0:
+                group["valid_depth_count"] += 1
+            if metadata.get("center_base") is not None or metadata.get("selected_grasp_base") is not None:
+                group["valid_tf_count"] += 1
+            score = float(metadata.get("final_score", 0.0) or 0.0)
+            best = group["best_candidate_score"]
+            if best is None or score > float(best):
+                group["best_candidate_score"] = score
+            group["candidates"].append(metadata)
+
+        traces = list(backend_trace or [])
+        for trace in traces:
+            backend_name = str(trace.get("backend", "unknown"))
+            group = backend_groups.setdefault(
+                backend_name,
+                {
+                    "backend": backend_name,
+                    "candidate_count": 0,
+                    "verified_candidate_count": 0,
+                    "rejected_candidate_count": 0,
+                    "valid_depth_count": 0,
+                    "valid_tf_count": 0,
+                    "best_candidate_score": None,
+                    "reject_reasons": {},
+                    "candidates": [],
+                },
+            )
+            raw_count = int(trace.get("raw_detection_count", 0) or 0)
+            group["raw_detection_count"] = int(group.get("raw_detection_count", 0) or 0) + raw_count
+            raw_labels = list(group.get("raw_labels", []))
+            raw_labels.extend(trace.get("raw_labels", []) or [])
+            group["raw_labels"] = raw_labels
+            raw_scores = list(group.get("raw_scores", []))
+            raw_scores.extend(trace.get("raw_scores", []) or [])
+            group["raw_scores"] = raw_scores
+            raw_bbox = list(group.get("raw_bbox_xyxy", []))
+            raw_bbox.extend(trace.get("raw_bbox_xyxy", []) or [])
+            group["raw_bbox_xyxy"] = raw_bbox
+            group.setdefault("backend_trace", []).append(trace)
+
+        return {
+            "target": target,
+            "selected_index": selected_index,
+            "candidates": candidates,
+            "backend_order": list(getattr(self, "backend_order_names", [])),
+            "allow_backend_fallback": bool(getattr(self, "allow_backend_fallback", True)),
+            "backend_debug": bool(getattr(self, "backend_debug", False)),
+            "backend_groups": [backend_groups[key] for key in sorted(backend_groups.keys())],
+            "backend_trace": traces,
+            "backend_decision": backend_decision or {},
+        }
+
+    def yolo_diagnostics_for_decision(self) -> dict[str, Any]:
+        for backend in self.backends:
+            if getattr(backend, "name", "") == "yolo" and hasattr(backend, "diagnostics"):
+                try:
+                    return backend.diagnostics()
+                except Exception as exc:
+                    return {"available": False, "last_failure_reason": str(exc)}
+        return {"available": False, "last_failure_reason": "yolo_not_configured"}
+
+    @staticmethod
+    def is_valid_yolo_record(target: str, record: dict[str, Any]) -> bool:
+        det = record.get("detection")
+        metadata = record.get("metadata", {})
+        verification = record.get("verification")
+        if det is None or getattr(det, "backend", "") != "yolo":
+            return False
+        if target != "object" and getattr(det, "label", "") != target:
+            return False
+        if record.get("reject_reason") is not None:
+            return False
+        if record.get("center_base") is None:
+            return False
+        if record.get("selected_grasp_base") is None:
+            return False
+        if float(metadata.get("grasp_score", 0.0) or 0.0) < 0.50:
+            return False
+        if verification is not None and not bool(getattr(verification, "accepted", True)):
+            return False
+        return True
+
+    def yolo_fallback_reason(
+        self,
+        target: str,
+        rankings: list[dict[str, Any]],
+        backend_trace: list[dict[str, Any]],
+        yolo_available: bool,
+    ) -> str | None:
+        if "yolo" not in getattr(self, "backend_order_names", []):
+            return "yolo_not_configured"
+        if not yolo_available:
+            return "yolo_backend_error"
+        yolo_records = [r for r in rankings if getattr(r.get("detection"), "backend", "") == "yolo"]
+        if any(self.is_valid_yolo_record(target, record) for record in yolo_records):
+            return None
+        yolo_traces = [trace for trace in backend_trace if trace.get("backend") == "yolo"]
+        raw_count = sum(int(trace.get("raw_detection_count", 0) or 0) for trace in yolo_traces)
+        if raw_count <= 0:
+            return "yolo_no_detections"
+        if not yolo_records:
+            rejection_counts: dict[str, int] = {}
+            last_reason = ""
+            for trace in yolo_traces:
+                last_reason = str(trace.get("last_failure_reason", "") or last_reason)
+                for key, value in (trace.get("rejection_counts", {}) or {}).items():
+                    rejection_counts[key] = int(rejection_counts.get(key, 0)) + int(value)
+            if rejection_counts.get("target_label_mismatch", 0) > 0:
+                return "yolo_no_target_match"
+            if rejection_counts.get("invalid_depth", 0) > 0:
+                return "yolo_invalid_depth"
+            if "confidence" in last_reason.lower():
+                return "yolo_low_confidence"
+            if last_reason:
+                return "yolo_backend_error"
+            return "yolo_no_target_match"
+        if all(record.get("center_base") is None for record in yolo_records):
+            return "yolo_invalid_tf"
+        if any(not bool(getattr(record.get("verification"), "accepted", True)) for record in yolo_records):
+            return "yolo_verifier_rejected"
+        if any(str(record.get("reject_reason", "")).startswith("base_transform") for record in yolo_records):
+            return "yolo_invalid_tf"
+        if any(record.get("reject_reason") == "no_grasp_candidate" for record in yolo_records):
+            return "yolo_low_grasp_score"
+        if max(float(record.get("metadata", {}).get("grasp_score", 0.0) or 0.0) for record in yolo_records) < 0.50:
+            return "yolo_low_grasp_score"
+        return "yolo_no_valid_candidate"
+
+    def select_record_with_backend_policy(
+        self,
+        target: str,
+        rankings: list[dict[str, Any]],
+        backend_trace: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        yolo_diag = self.yolo_diagnostics_for_decision()
+        yolo_available = bool(yolo_diag.get("available", False))
+        yolo_records = [r for r in rankings if getattr(r.get("detection"), "backend", "") == "yolo"]
+        valid_yolo = [record for record in yolo_records if self.is_valid_yolo_record(target, record)]
+        fallback_reason = self.yolo_fallback_reason(target, rankings, backend_trace, yolo_available)
+        forced_yolo_only = getattr(self, "backend_order_names", []) == ["yolo"]
+        decision = {
+            "policy": "priority_order_with_yolo_gate",
+            "yolo_available": yolo_available,
+            "yolo_candidate_count": len(yolo_records),
+            "yolo_valid_candidate_count": len(valid_yolo),
+            "fallback_reason": fallback_reason,
+            "allow_backend_fallback": bool(getattr(self, "allow_backend_fallback", True)),
+            "forced_yolo_only": bool(forced_yolo_only),
+            "selected_backend": None,
+            "yolo_diagnostics": yolo_diag,
+        }
+        if valid_yolo:
+            selected = sorted(valid_yolo, key=lambda r: float(r.get("final_score", 0.0)), reverse=True)[0]
+            decision["selected_backend"] = "yolo"
+            decision["fallback_reason"] = None
+            return selected, decision
+
+        if forced_yolo_only or not bool(getattr(self, "allow_backend_fallback", True)):
+            selected = yolo_records[0] if yolo_records else None
+            decision["selected_backend"] = "yolo" if selected is not None else None
+            return selected, decision
+
+        fallback_records = [
+            record for record in rankings
+            if getattr(record.get("detection"), "backend", "") != "yolo"
+        ]
+        selected = fallback_records[0] if fallback_records else (yolo_records[0] if yolo_records else None)
+        if selected is not None:
+            decision["selected_backend"] = getattr(selected.get("detection"), "backend", None)
+        return selected, decision
+
+    def pose_stamped_for_detection(self, det: Detection, cam: CameraState | None) -> PoseStamped | None:
+        pose_msg = PoseStamped()
+        pose_msg.header.frame_id = cam.cloud_msg.header.frame_id if cam is not None and cam.cloud_msg else det.frame_id
+        if cam is not None and cam.cloud_msg is not None:
+            pose_msg.header.stamp = cam.cloud_msg.header.stamp
+        else:
+            pose_msg.header.stamp = self.get_clock().now().to_msg()
+        pose_msg.pose.position.x = float(det.center_xyz[0])
+        pose_msg.pose.position.y = float(det.center_xyz[1])
+        pose_msg.pose.position.z = float(det.center_xyz[2])
+        pose_msg.pose.orientation.w = 1.0
+        if not pose_msg.header.frame_id:
+            return None
+        return pose_msg
+
+    @staticmethod
+    def image_crop_for_detection(image, bbox):
+        if image is None or bbox is None or len(bbox) != 4:
+            return None
+        h, w = image.shape[:2]
+        x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+        x1, x2 = max(0, x1), min(w, x2)
+        y1, y2 = max(0, y1), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return image[y1:y2, x1:x2, :3]
+
+    @staticmethod
+    def roi_points_for_detection(xyz, bbox):
+        if xyz is None or bbox is None or len(bbox) != 4:
+            return np.empty((0, 3), dtype=float)
+        h, w = xyz.shape[:2]
+        x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+        x1, x2 = max(0, x1), min(w, x2)
+        y1, y2 = max(0, y1), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            return np.empty((0, 3), dtype=float)
+        roi = xyz[y1:y2, x1:x2, :3]
+        mask = valid_xyz_mask(roi)
+        return roi[mask] if int(mask.sum()) else np.empty((0, 3), dtype=float)
+
+    @staticmethod
+    def point_dimensions(roi_points) -> dict[str, float | int]:
+        pts = np.asarray(roi_points, dtype=np.float64).reshape(-1, 3)
+        pts = pts[np.isfinite(pts).all(axis=1)] if pts.size else pts
+        pts = pts[pts[:, 2] > 0.05] if pts.size else pts
+        if pts.shape[0] < 3:
+            return {"point_count": int(pts.shape[0]), "width_m": 0.0, "length_m": 0.0, "height_m": 0.0}
+        spans = []
+        for axis in range(3):
+            lo, hi = np.nanpercentile(pts[:, axis], [5.0, 95.0])
+            spans.append(max(0.0, float(hi - lo)))
+        return {
+            "point_count": int(pts.shape[0]),
+            "width_m": float(min(spans[0], spans[1])),
+            "length_m": float(max(spans[0], spans[1])),
+            "height_m": float(spans[2]),
+        }
+
+    @staticmethod
+    def bbox_area(bbox) -> int:
+        if bbox is None or len(bbox) != 4:
+            return 0
+        x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+        return int(max(0, x2 - x1) * max(0, y2 - y1))
+
+    def isolation_score(self, det: Detection, detections: list[Detection]) -> float:
+        overlaps = []
+        for other in detections:
+            if other is det or other.camera_name != det.camera_name:
+                continue
+            overlaps.append(self.iou(det.bbox_xyxy, other.bbox_xyxy))
+        max_overlap = max(overlaps or [0.0])
+        return float(max(0.0, min(1.0, 1.0 - max_overlap)))
+
+    @staticmethod
+    def iou(a, b) -> float:
+        ax1, ay1, ax2, ay2 = [int(v) for v in a]
+        bx1, by1, bx2, by2 = [int(v) for v in b]
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = float(iw * ih)
+        area_a = float(max(1, (ax2 - ax1) * (ay2 - ay1)))
+        area_b = float(max(1, (bx2 - bx1) * (by2 - by1)))
+        return inter / max(1.0, area_a + area_b - inter)
+
+    @staticmethod
+    def reachability_score(center_base: PoseStamped | None) -> float:
+        if center_base is None:
+            return 0.50
+        p = center_base.pose.position
+        x, y, z = float(p.x), float(p.y), float(p.z)
+        in_bounds = 0.20 <= x <= 0.85 and -0.45 <= y <= 0.45 and -0.12 <= z <= 0.20
+        if not in_bounds:
+            return 0.05
+        radial = math.hypot(x, y)
+        radial_score = max(0.0, min(1.0, 1.0 - abs(radial - 0.50) / 0.40))
+        y_score = max(0.0, min(1.0, 1.0 - abs(y) / 0.45))
+        z_score = max(0.0, min(1.0, 1.0 - abs(z - 0.02) / 0.20))
+        return float(0.35 + 0.30 * radial_score + 0.25 * y_score + 0.10 * z_score)
+
+    @staticmethod
+    def workspace_edge_score(center_base: PoseStamped | None, center_xyz) -> float:
+        if center_base is None:
+            try:
+                z = float(center_xyz[2])
+                return 0.8 if z > 0.05 else 0.5
+            except Exception:
+                return 0.5
+        p = center_base.pose.position
+        x_margin = min(float(p.x) - 0.20, 0.85 - float(p.x))
+        y_margin = min(float(p.y) + 0.45, 0.45 - float(p.y))
+        margin = min(x_margin, y_margin)
+        return float(max(0.0, min(1.0, margin / 0.12)))
+
+    @staticmethod
+    def risk_factor(target: str) -> float:
+        risk = OBJECT_RISK.get(target, "medium")
+        if risk == "low":
+            return 1.0
+        if risk == "medium":
+            return 0.88
+        return 0.72
+
+    def backend_trace_entry(
+        self,
+        target: str,
+        cam: CameraState,
+        backend,
+        detections: list[Detection],
+        elapsed_sec: float,
+    ) -> dict[str, Any]:
+        backend_name = getattr(backend, "name", "unknown")
+        if backend_name == "yolo" and hasattr(backend, "last_debug_summary"):
+            trace = dict(getattr(backend, "last_debug_summary") or {})
+        else:
+            trace = {
+                "backend": backend_name,
+                "target": target,
+                "camera": cam.name,
+                "raw_detection_count": len(detections),
+                "raw_labels": [det.label for det in detections],
+                "raw_scores": [float(det.raw_score) for det in detections],
+                "raw_bbox_xyxy": [[int(v) for v in det.bbox_xyxy] for det in detections],
+                "normalized_labels": [det.label for det in detections],
+                "target_filtered_count": len(detections),
+                "accepted_count": len(detections),
+                "rejected_count": 0,
+                "rejection_counts": {},
+                "last_failure_reason": getattr(backend, "last_failure_reason", ""),
+            }
+        trace.update({
+            "request_target": target,
+            "camera": cam.name,
+            "backend": backend_name,
+            "elapsed_sec": float(elapsed_sec),
+            "target_filtered_count": int(len(detections)),
+            "valid_depth_count": int(len(detections)),
+        })
+        return trace
+
+    def save_request_debug(
+        self,
+        target: str,
+        cameras: list[CameraState],
+        all_detections: list[Detection],
+        rankings: list[dict[str, Any]],
+        selected_record: dict[str, Any] | None,
+        backend_trace: list[dict[str, Any]],
+        backend_decision: dict[str, Any],
+    ) -> None:
+        if not self.save_debug_images:
+            return
+        try:
+            import cv2
+
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            out_dir = os.path.join(self.debug_dir, f"{stamp}_{target}")
+            os.makedirs(out_dir, exist_ok=True)
+            selected = selected_record.get("detection") if selected_record is not None else None
+            for cam in cameras:
+                if cam.image_bgr is None:
+                    continue
+                cv2.imwrite(os.path.join(out_dir, f"{cam.name}_raw.png"), cam.image_bgr)
+                yolo_dets = [det for det in all_detections if det.backend == "yolo" and det.camera_name == cam.name]
+                yolo_img = draw_detections(cam.image_bgr, yolo_dets, selected if selected in yolo_dets else None)
+                if yolo_img is not None:
+                    cv2.imwrite(os.path.join(out_dir, f"{cam.name}_yolo_boxes.png"), yolo_img)
+                all_img = draw_detections(
+                    cam.image_bgr,
+                    [det for det in all_detections if det.camera_name == cam.name],
+                    selected if selected is not None and selected.camera_name == cam.name else None,
+                )
+                if all_img is not None:
+                    cv2.imwrite(os.path.join(out_dir, f"{cam.name}_selected_candidate.png"), all_img)
+            payload = self.build_candidate_ranking_payload(
+                target,
+                rankings,
+                selected_record,
+                backend_trace=backend_trace,
+                backend_decision=backend_decision,
+            )
+            with open(os.path.join(out_dir, "ranking.json"), "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, indent=2, sort_keys=True)
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to save vision debug images: {exc}")
+
     def detect_callback(self, request, response):
+        request_started = time.monotonic()
         prompt = getattr(request, "data", "")
         target = extract_target_label(prompt, default="object")
         target = normalize_label(target)
@@ -405,10 +1174,37 @@ class VisionServer(Node):
 
         all_detections: list[Detection] = []
         camera_by_name = {cam.name: cam for cam in cameras}
+        backend_detection_time = 0.0
+        self._ranking_grasp_time = 0.0
+        self._ranking_tf_time = 0.0
+        preliminary_rankings: list[dict[str, Any]] | None = None
+        preliminary_ranking_time = 0.0
+        backend_trace: list[dict[str, Any]] = []
 
         for cam in cameras:
+            camera_started_count = len(all_detections)
             for backend in self.backends:
+                backend_started = time.monotonic()
                 detections = backend.detect(cam.image_bgr, cam.cloud_msg, target, cam.name)
+                elapsed = time.monotonic() - backend_started
+                backend_detection_time += elapsed
+                trace = self.backend_trace_entry(target, cam, backend, detections, elapsed)
+                backend_trace.append(trace)
+                if self.backend_debug:
+                    self.get_logger().info(
+                        "Vision backend debug: " + json.dumps(trace, sort_keys=True)
+                    )
+                if detections:
+                    self.get_logger().info(
+                        f"Vision backend detections: backend={backend.name}, camera={cam.name}, "
+                        f"target={target}, count={len(detections)}"
+                    )
+                elif getattr(backend, "name", "") == "yolo":
+                    reason = getattr(backend, "last_failure_reason", "") or "no detections returned"
+                    self.get_logger().warn(
+                        f"Vision backend returned no detections: backend=yolo, camera={cam.name}, "
+                        f"target={target}, fallback_allowed={len(self.backends) > 1}, reason={reason}"
+                    )
                 for det in detections:
                     det.frame_id = cam.frame_id()
                 all_detections.extend(detections)
@@ -419,30 +1215,126 @@ class VisionServer(Node):
 
             if self.camera_selection_mode == "preferred_then_others" and all_detections:
                 break
+            if (
+                self.camera_selection_mode == "all"
+                and not self.backend_debug
+                and cam.name == self.preferred_camera
+                and target in {"meat_can", "coke_can", "strawberry"}
+                and len(all_detections) > camera_started_count
+            ):
+                preliminary_started = time.monotonic()
+                preliminary = self.build_candidate_rankings(target, all_detections, camera_by_name)
+                preliminary_ranking_time += time.monotonic() - preliminary_started
+                best = preliminary[0] if preliminary else None
+                top_skip_threshold = self.top_camera_min_final_score
+                if OBJECT_RISK.get(target, "medium") == "low":
+                    top_skip_threshold = min(
+                        top_skip_threshold,
+                        float(MIN_FINAL_CANDIDATE_SCORE.get(target, top_skip_threshold)),
+                    )
+                if (
+                    best is not None
+                    and best.get("reject_reason") is None
+                    and float(best.get("final_score", 0.0)) >= top_skip_threshold
+                ):
+                    self.get_logger().info(
+                        f"Top camera confident for {target}: final_score={float(best.get('final_score', 0.0)):.3f}; "
+                        f"threshold={top_skip_threshold:.3f}; skipping wrist-camera detection."
+                    )
+                    preliminary_rankings = preliminary
+                    break
 
-        # Sort globally. In `all` mode this lets the wrist camera win when it has
-        # a better semantic box, while still publishing the frame_id so downstream
-        # code knows how to transform the pose.  For thin/elongated objects like
-        # banana/hammer, however, top-camera geometry is usually more stable than
-        # wrist-camera close-ups, so allow object-specific camera preference.
-        selected = self.select_detection_for_target(target, all_detections)
-        selected_cam = camera_by_name.get(selected.camera_name) if selected is not None else None
+        if preliminary_rankings is not None:
+            rankings = preliminary_rankings
+            ranking_time = preliminary_ranking_time
+        else:
+            self._ranking_grasp_time = 0.0
+            self._ranking_tf_time = 0.0
+            ranking_started = time.monotonic()
+            rankings = self.build_candidate_rankings(target, all_detections, camera_by_name)
+            ranking_time = time.monotonic() - ranking_started
+        selected_record, backend_decision = self.select_record_with_backend_policy(
+            target,
+            rankings,
+            backend_trace,
+        )
+        selected = selected_record["detection"] if selected_record is not None else None
+        selected_cam = selected_record["camera"] if selected_record is not None else None
+        selected_is_valid_yolo = (
+            selected_record is not None
+            and self.is_valid_yolo_record(target, selected_record)
+        )
+        self.publish_candidate_ranking(
+            target,
+            rankings,
+            selected_record,
+            backend_trace=backend_trace,
+            backend_decision=backend_decision,
+        )
+        if self.backend_debug:
+            self.get_logger().info(
+                "Vision backend decision: " + json.dumps(backend_decision, sort_keys=True)
+            )
+        self.save_request_debug(
+            target,
+            cameras,
+            all_detections,
+            rankings,
+            selected_record,
+            backend_trace,
+            backend_decision,
+        )
 
-        if selected is None or selected.effective_score() < self.min_return_score:
+        if (
+            selected_record is None
+            or selected is None
+            or (
+                float(selected_record.get("final_score", 0.0)) < self.min_return_score
+                and not selected_is_valid_yolo
+            )
+            or (
+                selected_record.get("reject_reason") is not None
+                and not selected_is_valid_yolo
+            )
+        ):
             self.detections_pub.publish(String(data=json.dumps([d.to_dict() for d in all_detections])))
             response.pose = Pose()
-            if selected is None:
-                text = f"No detection produced for target='{target}' aliases={aliases}."
+            if selected_record is None or selected is None:
+                text = (
+                    f"No detection produced for target='{target}' aliases={aliases}. "
+                    f"backend_decision={backend_decision}"
+                )
             else:
                 text = (
                     f"Best detection below min_return_score for target='{target}': "
-                    f"score={selected.effective_score():.3f}, threshold={self.min_return_score:.3f}"
+                    f"semantic={selected.effective_score():.3f}, "
+                    f"final={float(selected_record.get('final_score', 0.0)):.3f}, "
+                    f"threshold={self.min_return_score:.3f}, "
+                    f"reject_reason={selected_record.get('reject_reason')}, "
+                    f"backend={selected.backend}, "
+                    f"fallback_reason={backend_decision.get('fallback_reason')}, "
+                    f"camera={selected_record.get('metadata', {}).get('camera_name', 'unknown')}, "
+                    f"transform_mode={selected_record.get('metadata', {}).get('transform_mode', 'unknown')}"
                 )
             set_response_text(response, text)
             self.get_logger().warn(text)
+            self.get_logger().info(
+                f"Vision timing target={target}: detection_time={backend_detection_time:.3f}s, "
+                f"grasp_estimation_time={self._ranking_grasp_time:.3f}s, tf_time={self._ranking_tf_time:.3f}s, "
+                f"ranking_time={ranking_time:.3f}s, total_task_time={time.monotonic() - request_started:.3f}s"
+            )
             return response
 
         selected.selected = True
+        selected_metadata = dict(selected_record["metadata"])
+        selected_metadata["selected"] = True
+        selected_metadata["yolo_available"] = bool(backend_decision.get("yolo_available", False))
+        selected_metadata["yolo_candidate_count"] = int(backend_decision.get("yolo_candidate_count", 0) or 0)
+        selected_metadata["yolo_valid_candidate_count"] = int(
+            backend_decision.get("yolo_valid_candidate_count", 0) or 0
+        )
+        selected_metadata["fallback_reason"] = backend_decision.get("fallback_reason")
+        selected_metadata["backend_decision"] = backend_decision
 
         p = Pose()
         p.position.x = float(selected.center_xyz[0])
@@ -450,15 +1342,24 @@ class VisionServer(Node):
         p.position.z = float(selected.center_xyz[2])
         p.orientation.w = 1.0
         response.pose = p
-        set_response_text(response, json.dumps(selected.to_dict()))
+        set_response_text(response, json.dumps(selected_metadata))
 
-        pose_msg = PoseStamped()
-        pose_msg.header.frame_id = selected_cam.cloud_msg.header.frame_id if selected_cam and selected_cam.cloud_msg else ""
-        pose_msg.header.stamp = self.get_clock().now().to_msg()
-        pose_msg.pose = p
+        pose_msg = selected_record.get("pose_msg") or PoseStamped()
+        if not pose_msg.header.frame_id:
+            pose_msg.header.frame_id = selected_cam.cloud_msg.header.frame_id if selected_cam and selected_cam.cloud_msg else ""
+        if selected_cam is not None and selected_cam.cloud_msg is not None:
+            pose_msg.header.stamp = selected_cam.cloud_msg.header.stamp
+        pose_msg.pose.position.x = p.position.x
+        pose_msg.pose.position.y = p.position.y
+        pose_msg.pose.position.z = p.position.z
+        pose_msg.pose.orientation.w = 1.0
         self.pose_pub.publish(pose_msg)
-        selected_pose_base = self.safe_transform_pose_stamped(pose_msg, self.base_frame)
-        selected_json = json.dumps(selected.to_dict())
+        selected_pose_base = selected_record.get("center_base")
+        if selected_pose_base is None:
+            tf_started = time.monotonic()
+            selected_pose_base = self.safe_transform_pose_stamped(pose_msg, self.base_frame)
+            self._ranking_tf_time += time.monotonic() - tf_started
+        selected_json = json.dumps(selected_metadata)
         self.selected_detection_pub.publish(String(data=selected_json))
 
         self.detections_pub.publish(String(data=json.dumps([d.to_dict() for d in all_detections])))
@@ -496,9 +1397,16 @@ class VisionServer(Node):
 
             if grasp_candidates:
                 selected_grasp = grasp_candidates[0]
-                selected_grasp.pose.header.stamp = self.get_clock().now().to_msg()
+                selected_grasp.pose.header.stamp = selected_cam.cloud_msg.header.stamp
                 self.selected_grasp_pub.publish(selected_grasp.pose)
-                selected_grasp_base = self.safe_transform_pose_stamped(selected_grasp.pose, self.base_frame)
+                tf_started = time.monotonic()
+                selected_grasp_base, selected_grasp_transform_mode = self.transform_pose_stamped_bounded(
+                    selected_grasp.pose,
+                    self.base_frame,
+                    candidate_started=time.monotonic(),
+                    camera_name=selected.camera_name,
+                )
+                self._ranking_tf_time += time.monotonic() - tf_started
                 selected_grasp_base, base_safety_info = self.apply_base_grasp_safety(target, selected_grasp_base)
                 candidate_dicts = [candidate.to_dict() for candidate in grasp_candidates]
                 candidate_dict = selected_grasp.to_dict()
@@ -521,6 +1429,7 @@ class VisionServer(Node):
                     candidate_dict.get("debug", {}).get("fallback", False)
                 )
                 grasp_payload["transform_success"] = selected_grasp_base is not None
+                grasp_payload["transform_mode"] = selected_grasp_transform_mode
                 grasp_payload["object_center_camera"] = _pose_stamped_to_dict(pose_msg)
                 grasp_payload["object_center_base"] = _pose_stamped_to_dict(selected_pose_base)
                 grasp_json = json.dumps(grasp_payload)
@@ -575,6 +1484,7 @@ class VisionServer(Node):
                     "selected_grasp_score": float(selected_grasp.score),
                     "selected_grasp_camera_frame": candidate_dict.get("pose_camera"),
                     "selected_grasp_base_link": _pose_stamped_to_dict(selected_grasp_base),
+                    "selected_grasp_transform_mode": selected_grasp_transform_mode,
                     "pre_grasp_pose": None,
                     "final_grasp_pose": _pose_stamped_to_dict(selected_grasp_base),
                     "gripper_width_estimate": float(selected_grasp.width),
@@ -634,39 +1544,108 @@ class VisionServer(Node):
             f"Selected target='{target}' label={selected.label} query={selected.query_text!r} "
             f"camera={selected.camera_name} frame={selected.frame_id!r} backend={selected.backend} "
             f"score={selected.score:.3f} raw_score={selected.raw_score:.3f} "
-            f"rank_score={selected.effective_score():.3f} xyz={selected.center_xyz}"
+            f"rank_score={selected.effective_score():.3f} "
+            f"final={float(selected_metadata.get('final_score', 0.0)):.3f}/"
+            f"{float(selected_metadata.get('final_threshold', self.min_return_score)):.3f} "
+            f"transform_mode={selected_metadata.get('transform_mode', 'unknown')} "
+            f"xyz={selected.center_xyz}"
+        )
+        self.get_logger().info(
+            f"Vision timing target={target}: detection_time={backend_detection_time:.3f}s, "
+            f"grasp_estimation_time={self._ranking_grasp_time:.3f}s, tf_time={self._ranking_tf_time:.3f}s, "
+            f"ranking_time={ranking_time:.3f}s, total_task_time={time.monotonic() - request_started:.3f}s"
         )
         return response
 
     def safe_transform_pose_stamped(self, stamped: PoseStamped, target_frame: str) -> PoseStamped | None:
+        transformed, _mode = self.transform_pose_stamped_bounded(stamped, target_frame)
+        return transformed
+
+    def transform_pose_stamped_bounded(
+        self,
+        stamped: PoseStamped,
+        target_frame: str,
+        *,
+        candidate_started: float | None = None,
+        camera_name: str = "",
+    ) -> tuple[PoseStamped | None, str]:
         source_frame = stamped.header.frame_id
         if not source_frame:
             self.get_logger().error("TF transform failed: grasp PoseStamped has an empty frame_id.")
-            return None
+            return None, "rejected_timeout"
         if source_frame == target_frame:
             out = PoseStamped()
             out.header = stamped.header
             out.pose = stamped.pose
-            return out
+            return out, "exact"
+
+        exact_detail = ""
+        exact_timeout = self.remaining_transform_timeout(
+            self.tf_exact_timeout_sec,
+            candidate_started,
+        )
+        if exact_timeout <= 0.0:
+            self.get_logger().warn(
+                f"TF transform rejected_timeout before exact lookup: camera={camera_name}, "
+                f"source={source_frame!r}, target={target_frame!r}, "
+                f"candidate_budget={self.tf_candidate_budget_sec:.2f}s"
+            )
+            return None, "rejected_timeout"
 
         try:
-            return self.tf_buffer.transform(
-                stamped,
+            exact_stamp = Time.from_msg(stamped.header.stamp)
+            tf_msg = self.tf_buffer.lookup_transform(
                 target_frame,
-                timeout=rclpy.duration.Duration(seconds=1.5),
+                source_frame,
+                exact_stamp,
+                timeout=rclpy.duration.Duration(seconds=exact_timeout),
             )
+            return self.apply_transform_to_pose(stamped, target_frame, tf_msg), "exact"
         except TypeException as exc:
+            exact_detail = str(exc)
             self.get_logger().warn(
-                "tf2 PoseStamped registration unavailable; using manual vision transform fallback. "
-                f"Detail: {exc}"
+                "TF exact lookup type failure; using latest-transform fallback. "
+                f"camera={camera_name}, source={source_frame!r}, target={target_frame!r}, detail={exc}"
             )
         except TransformException as exc:
+            exact_detail = str(exc)
+            level_msg = "future_extrapolation" if self.is_future_extrapolation(exc) else "exact_lookup_failed"
             self.get_logger().warn(
-                f"tf2 transform failed from {source_frame!r} to {target_frame!r}; "
-                f"trying manual latest-transform fallback. Detail: {exc}"
+                f"TF exact lookup {level_msg}; using latest fallback: camera={camera_name}, "
+                f"source={source_frame!r}, target={target_frame!r}, exact_timeout={exact_timeout:.3f}s, "
+                f"detail={exc}"
             )
 
-        return self.manual_transform_pose_stamped(stamped, target_frame)
+        latest_timeout = self.remaining_transform_timeout(
+            self.tf_latest_timeout_sec,
+            candidate_started,
+        )
+        if latest_timeout <= 0.0:
+            self.get_logger().warn(
+                f"TF transform rejected_timeout before latest fallback: camera={camera_name}, "
+                f"source={source_frame!r}, target={target_frame!r}, exact_detail={exact_detail}"
+            )
+            return None, "rejected_timeout"
+
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                Time(),
+                timeout=rclpy.duration.Duration(seconds=latest_timeout),
+            )
+            self.get_logger().warn(
+                f"TF transform mode=latest_fallback: camera={camera_name}, source={source_frame!r}, "
+                f"target={target_frame!r}, latest_timeout={latest_timeout:.3f}s, exact_detail={exact_detail}"
+            )
+            return self.apply_transform_to_pose(stamped, target_frame, tf_msg), "latest_fallback"
+        except TransformException as exc:
+            self.get_logger().warn(
+                f"TF transform mode=rejected_timeout: camera={camera_name}, source={source_frame!r}, "
+                f"target={target_frame!r}, latest_timeout={latest_timeout:.3f}s, "
+                f"exact_detail={exact_detail}, latest_detail={exc}"
+            )
+            return None, "rejected_timeout"
 
     def manual_transform_pose_stamped(self, stamped: PoseStamped, target_frame: str) -> PoseStamped | None:
         source_frame = stamped.header.frame_id
@@ -675,7 +1654,7 @@ class VisionServer(Node):
                 target_frame,
                 source_frame,
                 Time(),
-                timeout=rclpy.duration.Duration(seconds=1.5),
+                timeout=rclpy.duration.Duration(seconds=self.tf_latest_timeout_sec),
             )
         except TransformException as exc:
             self.get_logger().error(
@@ -683,6 +1662,30 @@ class VisionServer(Node):
             )
             return None
 
+        return self.apply_transform_to_pose(stamped, target_frame, tf_msg)
+
+    @staticmethod
+    def is_future_extrapolation(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "future" in text or "extrapolation into the future" in text
+
+    def remaining_transform_timeout(
+        self,
+        desired_timeout: float,
+        candidate_started: float | None,
+    ) -> float:
+        timeout = max(0.0, float(desired_timeout))
+        if candidate_started is None:
+            return timeout
+        remaining = self.tf_candidate_budget_sec - (time.monotonic() - candidate_started)
+        return max(0.0, min(timeout, remaining))
+
+    def apply_transform_to_pose(
+        self,
+        stamped: PoseStamped,
+        target_frame: str,
+        tf_msg,
+    ) -> PoseStamped:
         t = tf_msg.transform.translation
         q_tf_msg = tf_msg.transform.rotation
         q_tf = (q_tf_msg.x, q_tf_msg.y, q_tf_msg.z, q_tf_msg.w)

@@ -34,8 +34,14 @@ def generate_launch_description():
     scene_snapshot_enabled = LaunchConfiguration('scene_snapshot_enabled')
     scene_overlap_threshold = LaunchConfiguration('scene_overlap_threshold')
     completion_check_enabled = LaunchConfiguration('completion_check_enabled')
+    completion_check_mode = LaunchConfiguration('completion_check_mode')
     completion_xy_margin = LaunchConfiguration('completion_xy_margin')
     completion_shelf_xy_margin = LaunchConfiguration('completion_shelf_xy_margin')
+    startup_move_to_observe_before_first_task = LaunchConfiguration(
+        'startup_move_to_observe_before_first_task'
+    )
+    startup_observe_duration = LaunchConfiguration('startup_observe_duration')
+    startup_open_gripper_on_start = LaunchConfiguration('startup_open_gripper_on_start')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -45,8 +51,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'vision_backend',
-            default_value='hf_owlvit',
-            description='Primary vision backend: hf_owlvit, depth, or yolo.',
+            default_value='',
+            description='Optional backend override. Empty uses vision.yaml backend_order.',
         ),
         DeclareLaunchArgument(
             'camera_selection_mode',
@@ -105,7 +111,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'scene_snapshot_enabled',
-            default_value='true',
+            default_value='false',
             description='Probe task objects before multi-task execution for ordering hints.',
         ),
         DeclareLaunchArgument(
@@ -116,7 +122,12 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'completion_check_enabled',
             default_value='true',
-            description='Re-detect each object after place and retry if it is outside the target.',
+            description='Enable completion policy after place.',
+        ),
+        DeclareLaunchArgument(
+            'completion_check_mode',
+            default_value='runtime_safe',
+            description='Completion policy: runtime_safe or debug_ground_truth.',
         ),
         DeclareLaunchArgument(
             'completion_xy_margin',
@@ -127,6 +138,21 @@ def generate_launch_description():
             'completion_shelf_xy_margin',
             default_value='0.20',
             description='XY tolerance around the shelf target for completion checks.',
+        ),
+        DeclareLaunchArgument(
+            'startup_move_to_observe_before_first_task',
+            default_value='true',
+            description='Move arm to a deterministic observe pose before first detection.',
+        ),
+        DeclareLaunchArgument(
+            'startup_observe_duration',
+            default_value='3.0',
+            description='Seconds for the initial slow observe move.',
+        ),
+        DeclareLaunchArgument(
+            'startup_open_gripper_on_start',
+            default_value='true',
+            description='Open gripper before the first object detection.',
         ),
         Node(
             package='team_1',
@@ -169,8 +195,12 @@ def generate_launch_description():
                 'scene_snapshot_enabled': scene_snapshot_enabled,
                 'scene_overlap_threshold': scene_overlap_threshold,
                 'completion_check_enabled': completion_check_enabled,
+                'completion_check_mode': completion_check_mode,
                 'completion_xy_margin': completion_xy_margin,
                 'completion_shelf_xy_margin': completion_shelf_xy_margin,
+                'startup_move_to_observe_before_first_task': startup_move_to_observe_before_first_task,
+                'startup_observe_duration': startup_observe_duration,
+                'startup_open_gripper_on_start': startup_open_gripper_on_start,
             }],
         ),
     ])
