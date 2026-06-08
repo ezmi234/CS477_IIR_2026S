@@ -54,10 +54,25 @@
     yolo_conf: 0.05
     yolo_device: "auto"
     yolo:
-      enabled: true
+      enabled: false
       model_path: "/home/ubuntu/cs477_ws/src/cs477_IIR/team_1/models/yolo_five_objects_best.pt"
       confidence_threshold: 0.05
       device: "auto"
+    fail_open:
+      enabled: true
+      low_risk_objects: ["meat_can", "coke_can", "strawberry"]
+      allow_generic_object_fallback: true
+      allow_depth_cluster_fallback: true
+      min_generic_grasp_score: 0.75
+      min_depth_cluster_grasp_score: 0.80
+      max_attempts_per_object: 2
+      move_to_observe_before_retry: true
+    dataset_collection:
+      bbox_mode: "pointcloud_visible_box"
+      fallback_bbox_mode: "projected_3d_box"
+      min_visible_points: 30
+      bbox_margin_px: 4
+      min_bbox_area_px: 100
     grasp_config_file: "grasp.yaml"
     base_frame: "base_link"
 

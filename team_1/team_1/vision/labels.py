@@ -149,6 +149,16 @@ DETECTOR_ALIASES: dict[str, list[str]] = {
     "glue": ["glue", "glue stick"],
     "mustard_bottle": ["mustard bottle", "yellow bottle", "mustard"],
     "sticky_notes": ["sticky notes", "post it notes", "post-it notes"],
+    "object": ["object", "small object", "item on table", "thing on table"],
+}
+
+RELAXED_DETECTOR_ALIASES: dict[str, list[str]] = {
+    "banana": ["yellow banana", "curved yellow object", "yellow object", "banana"],
+    "meat_can": ["food can", "tin can", "metal can", "small can", "canned food", "small metal object"],
+    "coke_can": ["red can", "drink can", "soda can", "cola can", "beverage can", "red cylindrical object"],
+    "strawberry": ["red fruit", "small red object", "strawberry", "red round object"],
+    "hammer": ["hammer", "tool", "handle", "metal tool"],
+    "object": ["object", "small object", "item on table", "thing on table"],
 }
 
 # Penalty applied to weaker/generic aliases.  It is used only for ranking; the
@@ -247,7 +257,11 @@ def extract_target_label(prompt: str, default: str = "object") -> str:
     return default
 
 
-def detector_queries_for_target(target: str, include_templates: bool = True) -> list[DetectorQuery]:
+def detector_queries_for_target(
+    target: str,
+    include_templates: bool = True,
+    stage: str | None = None,
+) -> list[DetectorQuery]:
     """Return zero-shot detector queries for a canonical target.
 
     The returned query text is intentionally human/visual, while `canonical`
@@ -255,7 +269,14 @@ def detector_queries_for_target(target: str, include_templates: bool = True) -> 
     debug logs from showing generic labels such as "a_photo_of_a_object".
     """
     canonical = normalize_label(target)
-    aliases = DETECTOR_ALIASES.get(canonical)
+    stage_name = str(stage or "normal_target_detection").strip().lower()
+    if stage_name in {"relaxed_alias_detection", "relaxed"}:
+        aliases = RELAXED_DETECTOR_ALIASES.get(canonical, DETECTOR_ALIASES.get(canonical))
+    elif stage_name in {"generic_object_proposal", "generic"}:
+        aliases = RELAXED_DETECTOR_ALIASES.get("object", DETECTOR_ALIASES.get("object"))
+        canonical = "object"
+    else:
+        aliases = DETECTOR_ALIASES.get(canonical)
     if aliases is None:
         aliases = [_clean_text(target)] if target else []
 

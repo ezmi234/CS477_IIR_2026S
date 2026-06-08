@@ -19,17 +19,55 @@ from .config import (
     PICK_POSITION_OFFSETS,
     PLACE_CONFIGS,
     STORAGE_OBJECT_OVERRIDES,
+    UNCERTAIN_PICK_PROFILE,
 )
 from .grasp_orientation import yaw_candidates
 from .motion_math import calc_rot_time
 
 
 class PickPlaceMixin:
+    def fail_open_uncertain_pick_active(self, object_name):
+        provider = getattr(self, 'pose_provider', None)
+        text = getattr(provider, 'latest_detection_json', '') or ''
+        if not text:
+            return False
+        try:
+            data = json.loads(text)
+        except Exception:
+            return False
+        target = str(data.get('target', data.get('object_label', object_name)) or '').strip().lower().replace(' ', '_')
+        if target and target != object_name:
+            return False
+        stage = str(data.get('detection_stage', '') or '')
+        return bool(data.get('fail_open_used', False)) or stage in {
+            'relaxed_alias_detection',
+            'generic_object_proposal',
+            'depth_cluster_fallback',
+        }
+
     def object_grasp_profile(self, object_name):
         profile = dict(OBJECT_GRASP_PROFILES.get(object_name, {}))
+        profile['_profile_source'] = 'config'
+        profile['_calibration_override_active'] = False
+        profile['_calibration_override'] = {}
+        if self.fail_open_uncertain_pick_active(object_name):
+            profile.update(UNCERTAIN_PICK_PROFILE)
+            profile['_profile_source'] = 'fail_open_uncertain_pick'
+            profile['_fail_open_uncertain_pick'] = True
         runtime = getattr(self, 'calibration_profile_overrides', {}) or {}
-        if object_name in runtime and isinstance(runtime[object_name], dict):
-            profile.update(runtime[object_name])
+        override = runtime.get(object_name)
+        if isinstance(override, dict):
+            public_override = {
+                key: value
+                for key, value in override.items()
+                if not str(key).startswith('_')
+            }
+            if public_override:
+                profile.update(public_override)
+                profile['_profile_source'] = 'calibration_override'
+                profile['_calibration_override_active'] = True
+                profile['_calibration_override'] = public_override
+                profile['_calibration_override_topic'] = override.get('_source_topic', '')
         return profile
 
     def ground_truth_z_offset(self, object_name):
@@ -134,6 +172,7 @@ class PickPlaceMixin:
             'post_close_sleep',
             'close_force',
             'use_vision_grasp_orientation',
+            'require_lift_verification',
             'yaw_mode',
             'velocity_scale',
             'acceleration_scale',
@@ -278,6 +317,7 @@ class PickPlaceMixin:
         )
         post_close_sleep = float(overrides.get('post_close_sleep', 0.0))
         close_force = float(overrides.get('close_force', 1.0))
+        require_lift_verification = bool(overrides.get('require_lift_verification', False))
         close_timeout = float(profile.get('close_timeout', overrides.get('close_timeout', 3.0)))
         velocity_scale = self._bounded_motion_scale(
             profile.get('velocity_scale', overrides.get('velocity_scale', 1.0))
@@ -290,9 +330,22 @@ class PickPlaceMixin:
             descent_duration /= velocity_scale
             lift_duration /= velocity_scale
 
+        profile_source = str(profile.get('_profile_source', 'config') or 'config')
+        calibration_override_active = bool(profile.get('_calibration_override_active', False))
+        calibration_override = dict(profile.get('_calibration_override', {}) or {})
+        self.get_logger().info(
+            f'Active grasp profile for {object_name}: '
+            f'source={profile_source}, close_pos={close_pos:.3f}, '
+            f'z_offset={grasp_z_offset:.4f}, velocity_scale={velocity_scale:.2f}, '
+            f'yaw_mode={profile.get("yaw_mode", "default")}, '
+            f'require_lift_verification={require_lift_verification}'
+        )
         pick_plan = {
             'object_name': object_name,
             'grasp_profile': profile,
+            'profile_source': profile_source,
+            'calibration_override_active': calibration_override_active,
+            'calibration_override': calibration_override,
             'strategy': profile.get('strategy', overrides.get('strategy', 'unknown')),
             'yaw_mode': profile.get('yaw_mode', 'default'),
             'approach_pose': approach,
@@ -313,6 +366,7 @@ class PickPlaceMixin:
             'lift_duration': lift_duration,
             'post_close_sleep': post_close_sleep,
             'close_force': close_force,
+            'require_lift_verification': require_lift_verification,
             'close_timeout': close_timeout,
             'velocity_scale': velocity_scale,
             'acceleration_scale': acceleration_scale,
@@ -326,6 +380,7 @@ class PickPlaceMixin:
             f'grasp={self._pose_summary(grasp)}, '
             f'retreat={self._pose_summary(retreat)}, '
             f'close_pos={close_pos:.3f}, close_timeout={close_timeout:.1f}, '
+            f'z_offset={grasp_z_offset:.4f}, profile_source={profile_source}, '
             f'velocity_scale={velocity_scale:.2f}, acceleration_scale={acceleration_scale:.2f}, '
             f'selected_yaw={pick_plan["selected_yaw_info"].get("selected_yaw")}'
         )
@@ -382,6 +437,12 @@ class PickPlaceMixin:
                 pick_plan['retreat_pose'],
                 duration=pick_plan['lift_duration'],
             )
+            if bool(pick_plan.get('require_lift_verification', False)):
+                self.get_logger().warn(
+                    f'Uncertain pick lift verification: object={object_name}, '
+                    f'using runtime gripper-state proxy only; '
+                    f'actual_close_pos={getattr(self, "js_gripper_position", "unknown")}'
+                )
             self.publish_motion_debug(object_name, pick_plan, success=True)
         except Exception as exc:
             self.publish_motion_debug(object_name, pick_plan, success=False, error=str(exc))
@@ -699,6 +760,9 @@ class PickPlaceMixin:
             'object_label': object_name,
             'strategy': pick_plan.get('strategy', ''),
             'yaw_mode': pick_plan.get('yaw_mode', ''),
+            'profile_source': pick_plan.get('profile_source', 'config'),
+            'calibration_override_active': bool(pick_plan.get('calibration_override_active', False)),
+            'calibration_override': pick_plan.get('calibration_override', {}),
             'grasp_profile': pick_plan.get('grasp_profile', {}),
             'pre_grasp_pose': self._pose_to_dict(pick_plan.get('approach_pose')),
             'pre_grasp_low_pose': self._pose_to_dict(pick_plan.get('approach_low_pose')),
@@ -708,7 +772,9 @@ class PickPlaceMixin:
             'close_pos': float(pick_plan.get('close_pos', 0.0)),
             'close_force': float(pick_plan.get('close_force', 1.0)),
             'close_timeout': float(pick_plan.get('close_timeout', 3.0)),
+            'require_lift_verification': bool(pick_plan.get('require_lift_verification', False)),
             'grasp_z_offset': float(pick_plan.get('grasp_z_offset', 0.0)),
+            'z_offset': float(pick_plan.get('grasp_z_offset', 0.0)),
             'z_surface': float(pick_plan.get('target_z_surface', 0.0)),
             'z_commanded': float(pick_plan.get('z_commanded', 0.0)),
             'approach_height': float(pick_plan.get('approach_height', 0.0)),
@@ -744,6 +810,13 @@ class PickPlaceMixin:
             calibration_payload = {
                 'object': object_name,
                 'strategy': pick_plan.get('strategy', ''),
+                'close_pos': float(pick_plan.get('close_pos', 0.0)),
+                'z_offset': float(pick_plan.get('grasp_z_offset', 0.0)),
+                'velocity_scale': float(pick_plan.get('velocity_scale', 1.0)),
+                'yaw_mode': pick_plan.get('yaw_mode', ''),
+                'profile_source': pick_plan.get('profile_source', 'config'),
+                'calibration_override_active': bool(pick_plan.get('calibration_override_active', False)),
+                'calibration_override': pick_plan.get('calibration_override', {}),
                 'selected_detection': payload['selected_detection'],
                 'grasp': {
                     'frame': frame,
@@ -764,6 +837,7 @@ class PickPlaceMixin:
                     'estimated_width': float(pick_plan.get('gripper_width_estimate', 0.0)),
                     'close_pos': float(pick_plan.get('close_pos', 0.0)),
                     'close_timeout': float(pick_plan.get('close_timeout', 3.0)),
+                    'require_lift_verification': bool(pick_plan.get('require_lift_verification', False)),
                     'actual_close_pos': str(getattr(self, 'js_gripper_position', 'unknown')),
                 },
                 'motion': {
@@ -774,6 +848,8 @@ class PickPlaceMixin:
                     'lift_duration': float(pick_plan.get('lift_duration', 0.0)),
                     'velocity_scale': float(pick_plan.get('velocity_scale', 1.0)),
                     'acceleration_scale': float(pick_plan.get('acceleration_scale', 1.0)),
+                    'yaw_mode': pick_plan.get('yaw_mode', ''),
+                    'profile_source': pick_plan.get('profile_source', 'config'),
                 },
                 'profile': pick_plan.get('grasp_profile', {}),
                 'result': {

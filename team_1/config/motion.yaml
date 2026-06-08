@@ -23,6 +23,14 @@ motion_profile:
       velocity_scale: 0.50
       acceleration_scale: 0.50
 
+uncertain_pick_profile:
+  velocity_scale: 0.45
+  acceleration_scale: 0.45
+  approach_height: 0.14
+  lift_height: 0.10
+  close_force: 0.8
+  require_lift_verification: true
+
 startup:
   move_to_observe_before_first_task: true
   observe_duration: 3.0

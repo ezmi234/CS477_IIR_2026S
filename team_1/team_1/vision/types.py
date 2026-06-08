@@ -22,6 +22,8 @@ class Detection:
     rank_score: float = 0.0
     frame_id: str = ""
     selected: bool = False
+    detection_stage: str = "normal_target_detection"
+    fallback_reason: str = ""
 
     def effective_score(self) -> float:
         """Score used for final ranking across aliases/cameras."""

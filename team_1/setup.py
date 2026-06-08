@@ -30,6 +30,8 @@ setup(
             'vision_snapshot_collector = team_1.vision.snapshot_collector:main',
             'check_yolo_backend = team_1.tools.check_yolo_backend:main',
             'sweep_yolo_threshold = team_1.tools.sweep_yolo_threshold:main',
+            'collect_gazebo_yolo_dataset = team_1.tools.collect_gazebo_yolo_dataset:main',
+            'check_gazebo_yolo_dataset = team_1.tools.check_gazebo_yolo_dataset:main',
             'evaluate_perception_with_ground_truth = team_1.tools.evaluate_perception_with_ground_truth:main',
             'evaluate_pick_with_ground_truth = team_1.tools.evaluate_pick_with_ground_truth:main',
             'grasp_diagnostics = team_1.tools.run_grasp_diagnostics:main',

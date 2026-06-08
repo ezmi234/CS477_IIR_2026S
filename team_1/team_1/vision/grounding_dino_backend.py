@@ -92,7 +92,14 @@ class GroundingDinoBackend:
             self._warn_once(f"Grounding DINO warmup failed: {exc}")
             return False
 
-    def detect(self, image_bgr, cloud_msg, target_label: str, camera_name: str):
+    def detect(
+        self,
+        image_bgr,
+        cloud_msg,
+        target_label: str,
+        camera_name: str,
+        query_stage: str = "normal_target_detection",
+    ):
         if image_bgr is None or cloud_msg is None or not self._load():
             return []
         xyz = pointcloud2_to_xyz_image(cloud_msg)
@@ -153,6 +160,7 @@ class GroundingDinoBackend:
                     raw_label=raw_label,
                     raw_score=raw_score,
                     rank_score=raw_score,
+                    detection_stage=query_stage,
                 ))
             except Exception:
                 continue

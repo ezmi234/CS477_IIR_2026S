@@ -133,6 +133,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.motion_debug_pub = self.create_publisher(String, '/motion/debug', 10)
         self.ik_debug_pub = self.create_publisher(String, '/motion/ik_debug', 10)
         self.grasp_calibration_debug_pub = self.create_publisher(String, '/motion/grasp_calibration_debug', 10)
+        self.create_subscription(String, '/team_1/calibration_override', self.calibration_override_callback, 10)
         self.create_subscription(String, '/motion/grasp_profile_override', self.grasp_profile_override_callback, 10)
 
         service_name = self.get_parameter('detection_service').value
@@ -282,45 +283,92 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             )
 
     def grasp_profile_override_callback(self, msg):
+        self._handle_calibration_override(msg, '/motion/grasp_profile_override')
+
+    def calibration_override_callback(self, msg):
+        self._handle_calibration_override(msg, '/team_1/calibration_override')
+
+    def _handle_calibration_override(self, msg, source_topic):
         try:
             payload = json.loads(msg.data)
         except Exception as exc:
-            self.get_logger().warn(f'Ignoring invalid grasp profile override JSON: {exc}')
+            self.get_logger().warn(f'Ignoring invalid calibration override JSON on {source_topic}: {exc}')
             return
         if not isinstance(payload, dict):
+            self.get_logger().warn(f'Ignoring non-object calibration override on {source_topic}.')
             return
         object_name = str(payload.get('object', payload.get('object_name', ''))).strip().lower().replace(' ', '_')
-        if not object_name:
+        clear_requested = bool(payload.get('clear', False)) or payload.get('enabled') is False
+        if clear_requested:
+            if object_name:
+                self.calibration_profile_overrides.pop(object_name, None)
+                self.get_logger().info(f'Cleared calibration override for {object_name}.')
+            else:
+                self.calibration_profile_overrides.clear()
+                self.get_logger().info('Cleared all calibration overrides.')
             return
-        if bool(payload.get('clear', False)):
-            self.calibration_profile_overrides.pop(object_name, None)
-            self.get_logger().info(f'Cleared calibration grasp override for {object_name}.')
+        if not object_name:
+            self.get_logger().warn('Ignoring calibration override without an object field.')
             return
         values = payload.get('profile', payload)
         if not isinstance(values, dict):
+            self.get_logger().warn(f'Ignoring calibration override for {object_name}: values are not an object.')
             return
-        allowed = {
+        numeric_fields = {
             'close_pos',
             'close_timeout',
             'grasp_z_offset',
             'vision_grasp_z_offset',
+            'z_offset',
             'approach_height',
             'lift_height',
             'approach_duration',
             'descent_duration',
             'lift_duration',
-            'no_place',
-            'yaw_mode',
+            'post_close_sleep',
+            'close_force',
             'velocity_scale',
             'acceleration_scale',
         }
+        bool_fields = {'no_place', 'use_vision_grasp_orientation'}
+        string_fields = {'yaw_mode'}
         clean = {}
-        for key in allowed:
+        for key in numeric_fields:
             if key in values:
-                clean[key] = values[key]
+                try:
+                    clean[key] = float(values[key])
+                except (TypeError, ValueError):
+                    self.get_logger().warn(
+                        f'Ignoring non-numeric calibration override field {key}={values[key]!r} '
+                        f'for {object_name}.'
+                    )
+        for key in bool_fields:
+            if key in values:
+                clean[key] = bool(values[key])
+        for key in string_fields:
+            if key in values and values[key] is not None:
+                clean[key] = str(values[key])
+        if 'z_offset' in clean:
+            z_offset = clean.pop('z_offset')
+            clean.setdefault('grasp_z_offset', z_offset)
+            clean.setdefault('vision_grasp_z_offset', z_offset)
+        if 'velocity_scale' in clean and 'acceleration_scale' not in clean:
+            clean['acceleration_scale'] = clean['velocity_scale']
         if clean:
+            clean['_source'] = 'calibration_override'
+            clean['_source_topic'] = source_topic
+            clean['_received_time'] = time.time()
             self.calibration_profile_overrides[object_name] = clean
-            self.get_logger().info(f'Applied calibration grasp override for {object_name}: {clean}')
+            z_offset = clean.get('vision_grasp_z_offset', clean.get('grasp_z_offset'))
+            self.get_logger().info(
+                f'Calibration override active for {object_name}: '
+                f'close_pos={clean.get("close_pos")}, '
+                f'z_offset={z_offset}, '
+                f'velocity_scale={clean.get("velocity_scale")}, '
+                f'yaw_mode={clean.get("yaw_mode")}'
+            )
+        else:
+            self.get_logger().warn(f'Ignoring empty calibration override for {object_name}.')
 
     def queue_command(self, command, source=''):
         self.command_queue.append((command, source))
@@ -435,6 +483,11 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 f'Timing {self.current_task.object_name}: detection_time={self.current_detection_time:.3f}s'
             )
             if self.current_object_pose is None:
+                if OBJECT_RISK.get(self.current_task.object_name, 'medium') == 'low':
+                    self.get_logger().warn(
+                        f'target_detection_failed: target={self.current_task.object_name}, '
+                        'pose provider returned no usable pose.'
+                    )
                 if self.task_planner.should_defer_pose_failure(
                     self.current_task,
                     len(self.task_queue),
@@ -443,7 +496,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                     self.task_queue.append(deferred)
                     if OBJECT_RISK.get(self.current_task.object_name, 'medium') == 'low':
                         self.get_logger().warn(
-                            'Requeue low-risk object because overlap/clutter may change after other picks.'
+                            'requeue_low_risk_object: detection failed once; moving back through observe/retry policy.'
                         )
                     self.get_logger().warn(
                         'Pose provider failed; deferring task for replanning: '
@@ -875,6 +928,8 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             'verification_accepted': verification_accepted,
             'base_link_pose_exists': base_link_pose_exists,
             'selected_camera': detection.get('camera_name', detection.get('camera', '')),
+            'detection_stage': detection.get('detection_stage', 'normal_target_detection'),
+            'fail_open_used': bool(detection.get('fail_open_used', False)),
             'transform_mode': detection.get(
                 'transform_mode',
                 detection.get('center_transform_mode', grasp.get('transform_mode', '')),
@@ -892,6 +947,8 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         min_final = float(MIN_FINAL_CANDIDATE_SCORE.get(task.object_name, 0.35))
         risk = OBJECT_RISK.get(task.object_name, 'medium')
         selected_camera = quality.get('selected_camera') or 'unknown'
+        detection_stage = quality.get('detection_stage') or 'normal_target_detection'
+        fail_open_used = bool(quality.get('fail_open_used', False))
         transform_mode = quality.get('transform_mode') or 'unknown'
         base_link_pose_exists = bool(quality.get('base_link_pose_exists', False))
 
@@ -899,6 +956,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             f'Quality gate for {task.object_name}: semantic={semantic_score:.3f}/{min_score:.3f}, '
             f'final={final_score:.3f}/{min_final:.3f}, grasp={grasp_score:.3f}/{min_grasp:.3f}, '
             f'risk={risk}, selected_camera={selected_camera}, transform_mode={transform_mode}, '
+            f'detection_stage={detection_stage}, fail_open_used={fail_open_used}, '
             f'base_link_pose_exists={base_link_pose_exists}'
         )
 
@@ -962,6 +1020,18 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             return True
 
         if risk == 'low' and weak_candidate:
+            if fail_open_used and base_link_pose_exists and grasp_score >= min_grasp:
+                self.get_logger().warn(
+                    f'attempting_uncertain_low_risk_pick: target={task.object_name}, '
+                    f'detection_stage={detection_stage}, final={final_score:.3f}/{min_final:.3f}, '
+                    f'grasp={grasp_score:.3f}/{min_grasp:.3f}, camera={selected_camera}'
+                )
+                self.get_logger().info(
+                    f'Quality gate decision: target={task.object_name}, decision=execute, '
+                    f'reason=fail_open_uncertain_low_risk_pick, camera={selected_camera}, '
+                    f'transform_mode={transform_mode}, detection_stage={detection_stage}'
+                )
+                return False
             if low_risk_quality_override:
                 self.get_logger().info(
                     f'Quality gate decision: target={task.object_name}, decision=execute, '
@@ -1028,8 +1098,9 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         if not self.task_planner.should_retry_task_failure(task):
             return False
         self.get_logger().warn(
-            'Requeue low-risk object because overlap/clutter may change after other picks.'
+            f'requeue_low_risk_object: {task.label()} because {reason}.'
         )
+        self.startup_observe_done = False
         return self.requeue_task_for_retry(task, reason)
 
     def prepare_for_first_detection(self):

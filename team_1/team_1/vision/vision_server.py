@@ -215,6 +215,14 @@ class VisionServer(Node):
         self.declare_parameter("depth_min_area", 250)
         self.declare_parameter("debug", True)
         self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("fail_open.enabled", True)
+        self.declare_parameter("fail_open.low_risk_objects", ["meat_can", "coke_can", "strawberry"])
+        self.declare_parameter("fail_open.allow_generic_object_fallback", True)
+        self.declare_parameter("fail_open.allow_depth_cluster_fallback", True)
+        self.declare_parameter("fail_open.min_generic_grasp_score", 0.75)
+        self.declare_parameter("fail_open.min_depth_cluster_grasp_score", 0.80)
+        self.declare_parameter("fail_open.max_attempts_per_object", 2)
+        self.declare_parameter("fail_open.move_to_observe_before_retry", True)
 
         # Default topics match ur5_setup_set2_picking.launch.py in the tutorial environment.
         self.declare_parameter("top_rgb_topic", "/camera/camera/color/image_raw")
@@ -245,6 +253,23 @@ class VisionServer(Node):
         self.save_debug_images = bool(self.get_parameter("save_debug_images").value)
         self.debug_dir = str(self.get_parameter("debug_dir").value)
         self.base_frame = str(self.get_parameter("base_frame").value)
+        self.fail_open_enabled = bool(self.get_parameter("fail_open.enabled").value)
+        low_risk_values = self.get_parameter("fail_open.low_risk_objects").value
+        if isinstance(low_risk_values, str):
+            low_risk_values = [part.strip() for part in low_risk_values.split(",") if part.strip()]
+        self.fail_open_low_risk_objects = {normalize_label(value) for value in low_risk_values}
+        self.fail_open_allow_generic = bool(
+            self.get_parameter("fail_open.allow_generic_object_fallback").value
+        )
+        self.fail_open_allow_depth_cluster = bool(
+            self.get_parameter("fail_open.allow_depth_cluster_fallback").value
+        )
+        self.fail_open_min_generic_grasp_score = float(
+            self.get_parameter("fail_open.min_generic_grasp_score").value
+        )
+        self.fail_open_min_depth_cluster_grasp_score = float(
+            self.get_parameter("fail_open.min_depth_cluster_grasp_score").value
+        )
 
         self.bridge = CvBridge()
         self.cameras: dict[str, CameraState] = {name: CameraState(name=name) for name in self.camera_names}
@@ -336,6 +361,7 @@ class VisionServer(Node):
                         self.get_logger().warn(f"Could not read YOLO diagnostics: {exc}")
             else:
                 self.get_logger().warn(f"Unknown or unavailable vision backend name={name!r}.")
+        self.depth_cluster_backend = make_backend("depth", params)
         if bool(self.get_parameter("warmup_on_start").value):
             self.warmup_backends()
 
@@ -667,6 +693,17 @@ class VisionServer(Node):
                     "center_transform_mode": center_transform_mode,
                     "grasp_transform_mode": grasp_transform_mode,
                     "backend": det.backend,
+                    "detection_stage": getattr(det, "detection_stage", "normal_target_detection"),
+                    "semantic_detection_failed": getattr(det, "detection_stage", "normal_target_detection")
+                    != "normal_target_detection",
+                    "fail_open_used": getattr(det, "detection_stage", "normal_target_detection")
+                    in {
+                        "relaxed_alias_detection",
+                        "generic_object_proposal",
+                        "depth_cluster_fallback",
+                    },
+                    "fallback_reason": getattr(det, "fallback_reason", ""),
+                    "target": target,
                     "bbox_xyxy": [int(v) for v in det.bbox_xyxy],
                     "center_xyz": [float(v) for v in det.center_xyz],
                     "center_base": _pose_stamped_to_dict(center_base),
@@ -786,8 +823,27 @@ class VisionServer(Node):
             group["candidates"].append(metadata)
 
         traces = list(backend_trace or [])
+        stage_summary: dict[str, dict[str, Any]] = {}
         for trace in traces:
             backend_name = str(trace.get("backend", "unknown"))
+            stage_name = str(trace.get("detection_stage", "normal_target_detection"))
+            stage_entry = stage_summary.setdefault(
+                stage_name,
+                {
+                    "detection_stage": stage_name,
+                    "raw_detection_count": 0,
+                    "candidate_count": 0,
+                    "fail_open_used": bool(trace.get("fail_open_used", False)),
+                    "fallback_reason": trace.get("fallback_reason", ""),
+                },
+            )
+            stage_entry["raw_detection_count"] += int(trace.get("raw_detection_count", 0) or 0)
+            stage_entry["candidate_count"] += int(trace.get("target_filtered_count", 0) or 0)
+            stage_entry["fail_open_used"] = bool(
+                stage_entry.get("fail_open_used", False) or trace.get("fail_open_used", False)
+            )
+            if not stage_entry.get("fallback_reason") and trace.get("fallback_reason"):
+                stage_entry["fallback_reason"] = trace.get("fallback_reason")
             group = backend_groups.setdefault(
                 backend_name,
                 {
@@ -823,6 +879,7 @@ class VisionServer(Node):
             "allow_backend_fallback": bool(getattr(self, "allow_backend_fallback", True)),
             "backend_debug": bool(getattr(self, "backend_debug", False)),
             "backend_groups": [backend_groups[key] for key in sorted(backend_groups.keys())],
+            "fallback_stages": [stage_summary[key] for key in sorted(stage_summary.keys())],
             "backend_trace": traces,
             "backend_decision": backend_decision or {},
         }
@@ -1078,6 +1135,10 @@ class VisionServer(Node):
         backend,
         detections: list[Detection],
         elapsed_sec: float,
+        *,
+        detection_stage: str = "normal_target_detection",
+        query_target: str | None = None,
+        fallback_reason: str = "",
     ) -> dict[str, Any]:
         backend_name = getattr(backend, "name", "unknown")
         if backend_name == "yolo" and hasattr(backend, "last_debug_summary"):
@@ -1100,6 +1161,16 @@ class VisionServer(Node):
             }
         trace.update({
             "request_target": target,
+            "query_target": normalize_label(query_target or target),
+            "detection_stage": detection_stage,
+            "semantic_detection_failed": detection_stage != "normal_target_detection",
+            "fail_open_used": detection_stage
+            in {
+                "relaxed_alias_detection",
+                "generic_object_proposal",
+                "depth_cluster_fallback",
+            },
+            "fallback_reason": fallback_reason,
             "camera": cam.name,
             "backend": backend_name,
             "elapsed_sec": float(elapsed_sec),
@@ -1154,6 +1225,196 @@ class VisionServer(Node):
         except Exception as exc:
             self.get_logger().warn(f"Failed to save vision debug images: {exc}")
 
+    def fail_open_allowed_for_target(self, target: str) -> bool:
+        if not self.fail_open_enabled:
+            return False
+        if target not in self.fail_open_low_risk_objects:
+            return False
+        return OBJECT_RISK.get(target, "medium") == "low"
+
+    def selected_record_passes_return_gate(
+        self,
+        target: str,
+        selected_record: dict[str, Any] | None,
+        backend_decision: dict[str, Any] | None,
+    ) -> bool:
+        if selected_record is None:
+            return False
+        selected = selected_record.get("detection")
+        if selected is None:
+            return False
+        selected_is_valid_yolo = self.is_valid_yolo_record(target, selected_record)
+        if (
+            float(selected_record.get("final_score", 0.0)) < self.min_return_score
+            and not selected_is_valid_yolo
+        ):
+            return False
+        if selected_record.get("reject_reason") is not None and not selected_is_valid_yolo:
+            return False
+
+        metadata = selected_record.get("metadata", {}) or {}
+        stage = str(metadata.get("detection_stage", getattr(selected, "detection_stage", "")) or "")
+        if stage == "generic_object_proposal":
+            return float(metadata.get("grasp_score", 0.0) or 0.0) >= self.fail_open_min_generic_grasp_score
+        if stage == "depth_cluster_fallback":
+            return float(metadata.get("grasp_score", 0.0) or 0.0) >= self.fail_open_min_depth_cluster_grasp_score
+        return True
+
+    def run_detection_stage(
+        self,
+        *,
+        stage: str,
+        target: str,
+        query_target: str,
+        cameras: list[CameraState],
+        backends: list[Any],
+        all_detections: list[Detection],
+        backend_trace: list[dict[str, Any]],
+        fallback_reason: str,
+    ) -> float:
+        stage_detection_time = 0.0
+        for cam in cameras:
+            for backend in backends:
+                if backend is None:
+                    continue
+                backend_started = time.monotonic()
+                try:
+                    detections = backend.detect(
+                        cam.image_bgr,
+                        cam.cloud_msg,
+                        query_target,
+                        cam.name,
+                        query_stage=stage,
+                    )
+                except TypeError:
+                    detections = backend.detect(cam.image_bgr, cam.cloud_msg, query_target, cam.name)
+                except Exception as exc:
+                    self.get_logger().warn(
+                        f"Fail-open backend error: stage={stage}, backend={getattr(backend, 'name', 'unknown')}, "
+                        f"camera={cam.name}, target={target}, error={exc}"
+                    )
+                    detections = []
+                elapsed = time.monotonic() - backend_started
+                stage_detection_time += elapsed
+                for det in detections:
+                    det.frame_id = cam.frame_id()
+                    det.detection_stage = stage
+                    det.fallback_reason = fallback_reason
+                    if query_target == "object" and det.label == "object":
+                        det.raw_label = det.raw_label or "generic object proposal"
+                        det.query_text = det.query_text or "object"
+                trace = self.backend_trace_entry(
+                    target,
+                    cam,
+                    backend,
+                    detections,
+                    elapsed,
+                    detection_stage=stage,
+                    query_target=query_target,
+                    fallback_reason=fallback_reason,
+                )
+                backend_trace.append(trace)
+                if self.backend_debug:
+                    self.get_logger().info("Vision backend debug: " + json.dumps(trace, sort_keys=True))
+                if detections:
+                    self.get_logger().warn(
+                        f"Fail-open stage produced candidates: stage={stage}, "
+                        f"backend={getattr(backend, 'name', 'unknown')}, camera={cam.name}, "
+                        f"target={target}, count={len(detections)}"
+                    )
+                all_detections.extend(detections)
+        return stage_detection_time
+
+    def try_fail_open_stages(
+        self,
+        *,
+        target: str,
+        cameras: list[CameraState],
+        camera_by_name: dict[str, CameraState],
+        all_detections: list[Detection],
+        backend_trace: list[dict[str, Any]],
+        rankings: list[dict[str, Any]],
+        selected_record: dict[str, Any] | None,
+        backend_decision: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, Any], float, float]:
+        detection_extra = 0.0
+        ranking_extra = 0.0
+        if not self.fail_open_allowed_for_target(target):
+            return rankings, selected_record, backend_decision, detection_extra, ranking_extra
+        if self.selected_record_passes_return_gate(target, selected_record, backend_decision):
+            return rankings, selected_record, backend_decision, detection_extra, ranking_extra
+
+        self.get_logger().warn(
+            f"target_detection_failed: target={target}, starting fail-open perception stages."
+        )
+        stages: list[tuple[str, str, list[Any], str, str]] = [
+            (
+                "relaxed_alias_detection",
+                target,
+                self.backends,
+                "no_target_specific_detection",
+                "using_relaxed_alias_detection",
+            ),
+        ]
+        if self.fail_open_allow_generic:
+            stages.append((
+                "generic_object_proposal",
+                "object",
+                self.backends,
+                "no_target_specific_detection",
+                "using_generic_object_proposal",
+            ))
+        if self.fail_open_allow_depth_cluster:
+            stages.append((
+                "depth_cluster_fallback",
+                "object",
+                [self.depth_cluster_backend],
+                "no_target_specific_detection",
+                "using_depth_cluster_fallback",
+            ))
+
+        for stage, query_target, backends, fallback_reason, log_token in stages:
+            self.get_logger().warn(f"{log_token}: target={target}, query_target={query_target}")
+            detection_extra += self.run_detection_stage(
+                stage=stage,
+                target=target,
+                query_target=query_target,
+                cameras=cameras,
+                backends=backends,
+                all_detections=all_detections,
+                backend_trace=backend_trace,
+                fallback_reason=fallback_reason,
+            )
+            ranking_started = time.monotonic()
+            rankings = self.build_candidate_rankings(target, all_detections, camera_by_name)
+            ranking_extra += time.monotonic() - ranking_started
+            selected_record, backend_decision = self.select_record_with_backend_policy(
+                target,
+                rankings,
+                backend_trace,
+            )
+            backend_decision["fail_open_enabled"] = True
+            backend_decision["fail_open_stage_evaluated"] = stage
+            backend_decision["fail_open_target"] = target
+            if self.selected_record_passes_return_gate(target, selected_record, backend_decision):
+                metadata = selected_record.get("metadata", {}) if selected_record is not None else {}
+                selected_stage = metadata.get("detection_stage", stage)
+                backend_decision["fail_open_selected_stage"] = selected_stage
+                backend_decision["fail_open_used"] = selected_stage != "normal_target_detection"
+                if selected_stage != "normal_target_detection":
+                    self.get_logger().warn(
+                        f"attempting_uncertain_low_risk_pick: target={target}, "
+                        f"detection_stage={selected_stage}, final_score={float(metadata.get('final_score', 0.0)):.3f}, "
+                        f"grasp_score={float(metadata.get('grasp_score', 0.0)):.3f}, "
+                        f"camera={metadata.get('camera_name', 'unknown')}"
+                    )
+                return rankings, selected_record, backend_decision, detection_extra, ranking_extra
+
+        backend_decision["fail_open_enabled"] = True
+        backend_decision["fail_open_used"] = False
+        backend_decision["fail_open_failure_reason"] = "no_safe_fallback_candidate"
+        return rankings, selected_record, backend_decision, detection_extra, ranking_extra
+
     def detect_callback(self, request, response):
         request_started = time.monotonic()
         prompt = getattr(request, "data", "")
@@ -1185,10 +1446,24 @@ class VisionServer(Node):
             camera_started_count = len(all_detections)
             for backend in self.backends:
                 backend_started = time.monotonic()
-                detections = backend.detect(cam.image_bgr, cam.cloud_msg, target, cam.name)
+                detections = backend.detect(
+                    cam.image_bgr,
+                    cam.cloud_msg,
+                    target,
+                    cam.name,
+                    query_stage="normal_target_detection",
+                )
                 elapsed = time.monotonic() - backend_started
                 backend_detection_time += elapsed
-                trace = self.backend_trace_entry(target, cam, backend, detections, elapsed)
+                trace = self.backend_trace_entry(
+                    target,
+                    cam,
+                    backend,
+                    detections,
+                    elapsed,
+                    detection_stage="normal_target_detection",
+                    query_target=target,
+                )
                 backend_trace.append(trace)
                 if self.backend_debug:
                     self.get_logger().info(
@@ -1207,6 +1482,7 @@ class VisionServer(Node):
                     )
                 for det in detections:
                     det.frame_id = cam.frame_id()
+                    det.detection_stage = "normal_target_detection"
                 all_detections.extend(detections)
 
                 # Legacy mode: keep the old behavior, useful for quick fallback tests.
@@ -1258,12 +1534,20 @@ class VisionServer(Node):
             rankings,
             backend_trace,
         )
+        rankings, selected_record, backend_decision, detection_extra, ranking_extra = self.try_fail_open_stages(
+            target=target,
+            cameras=cameras,
+            camera_by_name=camera_by_name,
+            all_detections=all_detections,
+            backend_trace=backend_trace,
+            rankings=rankings,
+            selected_record=selected_record,
+            backend_decision=backend_decision,
+        )
+        backend_detection_time += detection_extra
+        ranking_time += ranking_extra
         selected = selected_record["detection"] if selected_record is not None else None
         selected_cam = selected_record["camera"] if selected_record is not None else None
-        selected_is_valid_yolo = (
-            selected_record is not None
-            and self.is_valid_yolo_record(target, selected_record)
-        )
         self.publish_candidate_ranking(
             target,
             rankings,
@@ -1285,18 +1569,7 @@ class VisionServer(Node):
             backend_decision,
         )
 
-        if (
-            selected_record is None
-            or selected is None
-            or (
-                float(selected_record.get("final_score", 0.0)) < self.min_return_score
-                and not selected_is_valid_yolo
-            )
-            or (
-                selected_record.get("reject_reason") is not None
-                and not selected_is_valid_yolo
-            )
-        ):
+        if not self.selected_record_passes_return_gate(target, selected_record, backend_decision):
             self.detections_pub.publish(String(data=json.dumps([d.to_dict() for d in all_detections])))
             response.pose = Pose()
             if selected_record is None or selected is None:
@@ -1333,7 +1606,25 @@ class VisionServer(Node):
         selected_metadata["yolo_valid_candidate_count"] = int(
             backend_decision.get("yolo_valid_candidate_count", 0) or 0
         )
-        selected_metadata["fallback_reason"] = backend_decision.get("fallback_reason")
+        stage = str(selected_metadata.get("detection_stage", "normal_target_detection") or "normal_target_detection")
+        selected_metadata["detection_stage"] = stage
+        selected_metadata["semantic_detection_failed"] = stage != "normal_target_detection"
+        selected_metadata["fail_open_used"] = bool(
+            selected_metadata.get("fail_open_used", False)
+            or backend_decision.get("fail_open_used", False)
+            or stage
+            in {
+                "relaxed_alias_detection",
+                "generic_object_proposal",
+                "depth_cluster_fallback",
+            }
+        )
+        selected_metadata["fallback_reason"] = (
+            selected_metadata.get("fallback_reason")
+            or backend_decision.get("fail_open_failure_reason")
+            or backend_decision.get("fallback_reason")
+        )
+        selected_metadata["target"] = target
         selected_metadata["backend_decision"] = backend_decision
 
         p = Pose()

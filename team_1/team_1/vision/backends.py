@@ -33,7 +33,14 @@ class DepthColorProposalBackend:
     def warmup(self):
         return False
 
-    def detect(self, image_bgr: np.ndarray, cloud_msg, target_label: str, camera_name: str) -> list[Detection]:
+    def detect(
+        self,
+        image_bgr: np.ndarray,
+        cloud_msg,
+        target_label: str,
+        camera_name: str,
+        query_stage: str = "depth_cluster_fallback",
+    ) -> list[Detection]:
         xyz = pointcloud2_to_xyz_image(cloud_msg)
         if image_bgr is None or xyz is None:
             return []
@@ -82,6 +89,7 @@ class DepthColorProposalBackend:
                     center_xyz=center,
                     camera_name=camera_name,
                     backend=self.name,
+                    detection_stage=query_stage,
                 ))
 
             detections.sort(key=lambda d: d.score, reverse=True)
@@ -103,6 +111,7 @@ class DepthColorProposalBackend:
                 center_xyz=center,
                 camera_name=camera_name,
                 backend=self.name,
+                detection_stage=query_stage,
             )]
 
 
@@ -155,7 +164,14 @@ class OwlVitBackend:
             self.model(**inputs)
         return True
 
-    def detect(self, image_bgr: np.ndarray, cloud_msg, target_label: str, camera_name: str) -> list[Detection]:
+    def detect(
+        self,
+        image_bgr: np.ndarray,
+        cloud_msg,
+        target_label: str,
+        camera_name: str,
+        query_stage: str = "normal_target_detection",
+    ) -> list[Detection]:
         try:
             self._load()
         except Exception as exc:
@@ -169,7 +185,7 @@ class OwlVitBackend:
         import cv2
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         pil = self.PILImage.fromarray(image_rgb)
-        queries = detector_queries_for_target(target_label)
+        queries = detector_queries_for_target(target_label, stage=query_stage)
         if not queries:
             return []
 
@@ -229,6 +245,7 @@ class OwlVitBackend:
                 raw_label=raw_label,
                 raw_score=raw_score,
                 rank_score=rank_score,
+                detection_stage=query_stage,
             ))
 
         detections.sort(key=lambda d: d.rank_score if d.rank_score else d.score, reverse=True)

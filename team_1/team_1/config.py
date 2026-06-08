@@ -262,6 +262,15 @@ OBJECT_GRASP_PROFILES = {
     },
 }
 
+UNCERTAIN_PICK_PROFILE = {
+    'velocity_scale': 0.45,
+    'acceleration_scale': 0.45,
+    'approach_height': 0.14,
+    'lift_height': 0.10,
+    'close_force': 0.8,
+    'require_lift_verification': True,
+}
+
 STORAGE_OBJECT_OVERRIDES = {
     'banana': {
         'approach_duration': 2.0,
@@ -396,6 +405,9 @@ def _apply_target_config():
 
 def _apply_motion_config():
     motion = _load_package_yaml('motion.yaml')
+    uncertain = motion.get('uncertain_pick_profile', {})
+    if isinstance(uncertain, dict):
+        _deep_update(UNCERTAIN_PICK_PROFILE, uncertain)
     profile_config = motion.get('motion_profile', {})
     if isinstance(profile_config, dict):
         mode = str(profile_config.get('mode', 'competition') or 'competition')

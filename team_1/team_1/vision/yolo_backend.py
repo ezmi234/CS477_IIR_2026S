@@ -255,7 +255,14 @@ class YoloBackend:
             self._warn_once("warmup_failed", f"YOLO warmup failed: {reason}")
             return False
 
-    def detect(self, image_bgr, cloud_msg, target_label: str, camera_name: str):
+    def detect(
+        self,
+        image_bgr,
+        cloud_msg,
+        target_label: str,
+        camera_name: str,
+        query_stage: str = "normal_target_detection",
+    ):
         self._reset_last_debug(target_label, camera_name, image_bgr)
         if image_bgr is None:
             self._last_failure_reason = "no RGB image available"
@@ -395,6 +402,7 @@ class YoloBackend:
                     raw_label=raw_label,
                     raw_score=raw_score,
                     rank_score=raw_score,
+                    detection_stage=query_stage,
                 ))
             except Exception:
                 malformed += 1

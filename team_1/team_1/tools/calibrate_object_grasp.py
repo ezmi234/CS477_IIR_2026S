@@ -12,14 +12,27 @@ from typing import Any
 
 import rclpy
 from rclpy.node import Node
-from rclpy.parameter import Parameter
-from rclpy.parameter_client import AsyncParameterClient
+from riro_srvs.srv import StringPose
 from std_msgs.msg import String
+
+try:
+    from gazebo_msgs.msg import ModelStates
+except Exception:
+    ModelStates = None
 
 try:
     from sensor_msgs.msg import Image
 except Exception:
     Image = None
+
+from .debug_eval_common import (
+    CONTEST_OBJECTS,
+    dict_to_pose,
+    model_states_to_objects,
+    pose_distance,
+    pose_to_dict,
+    xy_distance,
+)
 
 
 DEFAULT_OUT_ROOT = Path("/home/ubuntu/cs477_ws/debug_runs/grasp_calibration")
@@ -38,13 +51,19 @@ class CalibrationRunner(Node):
             "grasp_calibration_debug": [],
         }
         self.publisher = self.create_publisher(String, "/task_commands", 10)
-        self.override_pub = self.create_publisher(String, "/motion/grasp_profile_override", 10)
+        self.override_pub = self.create_publisher(String, "/team_1/calibration_override", 10)
+        self.vision_client = self.create_client(StringPose, args.vision_service)
+        self.gt_objects = {}
         self.create_subscription(String, "/vision/selected_detection", lambda m: self._append("selected_detection", m), 10)
         self.create_subscription(String, "/vision/candidate_ranking", lambda m: self._append("candidate_ranking", m), 10)
         self.create_subscription(String, "/vision/grasp_debug", lambda m: self._append("vision_grasp_debug", m), 10)
         self.create_subscription(String, "/motion/debug", lambda m: self._append("motion_debug", m), 10)
         self.create_subscription(String, "/motion/grasp_calibration_debug", lambda m: self._append("grasp_calibration_debug", m), 10)
-        self.param_client = AsyncParameterClient(self, "team_1_contest_executor")
+        if self.strict_target_enabled() and ModelStates is not None:
+            self.create_subscription(ModelStates, "/gazebo/model_states", self.model_states_cb, 10)
+            self.create_subscription(ModelStates, "/ros2_grasp/model_states", self.model_states_cb, 10)
+        elif self.strict_target_enabled():
+            self.get_logger().warn("gazebo_msgs/ModelStates unavailable; strict target gate cannot use GT.")
         self.saved_images = 0
         if Image is not None and args.save_debug:
             self.create_subscription(Image, "/vision/debug_image", self._debug_image_cb, 10)
@@ -82,15 +101,20 @@ class CalibrationRunner(Node):
         while rclpy.ok() and time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.05)
 
-    def set_dry_run(self, enabled: bool):
-        if not enabled:
-            return
-        if not self.param_client.wait_for_services(timeout_sec=2.0):
-            self.get_logger().warn("Could not reach team_1_contest_executor parameter service for --dry-run.")
-            return
-        future = self.param_client.set_parameters([Parameter("dry_run_motion", Parameter.Type.BOOL, True)])
-        rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
-        self.get_logger().info("Requested dry_run_motion=true on team_1_contest_executor.")
+    def strict_target_enabled(self) -> bool:
+        return bool(self.args.use_gt_eval or self.args.strict_target)
+
+    def model_states_cb(self, msg):
+        self.gt_objects = model_states_to_objects(msg, CONTEST_OBJECTS)
+
+    def log_runtime_configuration_note(self):
+        if self.args.dry_run:
+            self.get_logger().warn(
+                "--dry-run recorded as calibration metadata; executor dry-run mode must be configured at launch."
+            )
+        self.get_logger().warn(
+            "Skipping executor parameter update; configure launch/config before running this evaluator."
+        )
 
     def publish_override(
         self,
@@ -101,27 +125,32 @@ class CalibrationRunner(Node):
         velocity_scale: float | None,
         no_place: bool,
     ):
-        profile: dict[str, Any] = {}
+        payload: dict[str, Any] = {
+            "enabled": True,
+            "object": object_name,
+            "source": "calibrate_object_grasp",
+        }
         if close_pos is not None:
-            profile["close_pos"] = float(close_pos)
+            payload["close_pos"] = float(close_pos)
         if z_offset is not None:
-            profile["grasp_z_offset"] = float(z_offset)
-            profile["vision_grasp_z_offset"] = float(z_offset)
+            payload["grasp_z_offset"] = float(z_offset)
+            payload["vision_grasp_z_offset"] = float(z_offset)
         if yaw_mode:
-            profile["yaw_mode"] = str(yaw_mode)
+            payload["yaw_mode"] = str(yaw_mode)
         if velocity_scale is not None:
-            profile["velocity_scale"] = float(velocity_scale)
-            profile["acceleration_scale"] = float(velocity_scale)
+            payload["velocity_scale"] = float(velocity_scale)
+            payload["acceleration_scale"] = float(velocity_scale)
         if no_place:
-            profile["no_place"] = True
-        payload = {"object": object_name, "profile": profile}
+            payload["no_place"] = True
         self.override_pub.publish(String(data=json.dumps(payload)))
-        self.get_logger().info(f"Published grasp profile override: {payload}")
-        self.spin_for(0.4)
+        self.get_logger().info(f"Published calibration override: {payload}")
+        self.spin_for(0.5)
 
     def clear_override(self, object_name: str):
-        self.override_pub.publish(String(data=json.dumps({"object": object_name, "clear": True})))
-        self.spin_for(0.2)
+        payload = {"enabled": False, "clear": True, "object": object_name}
+        self.override_pub.publish(String(data=json.dumps(payload)))
+        self.get_logger().info(f"Cleared calibration override: {payload}")
+        self.spin_for(0.3)
 
     def publish_command(self, object_name: str, target: str):
         phrase = object_name.replace("_", " ")
@@ -129,6 +158,217 @@ class CalibrationRunner(Node):
         command = f"Move the {phrase} to the {destination}."
         self.publisher.publish(String(data=command))
         self.get_logger().info(f"Published calibration command: {command}")
+
+    def wait_for_ground_truth(self, object_name: str, timeout_sec: float = 5.0) -> bool:
+        if not self.strict_target_enabled():
+            return True
+        deadline = time.time() + float(timeout_sec)
+        while rclpy.ok() and time.time() < deadline:
+            if object_name in self.gt_objects:
+                pose = self.gt_objects[object_name]
+                self.get_logger().info(
+                    f"strict_target_gt_pose: object={object_name}, "
+                    f"x={pose.position.x:.3f}, y={pose.position.y:.3f}, z={pose.position.z:.3f}"
+                )
+                return True
+            rclpy.spin_once(self, timeout_sec=0.1)
+        self.get_logger().warn(
+            f"strict_target_gt_unavailable: object={object_name}, available={sorted(self.gt_objects.keys())}"
+        )
+        return False
+
+    def wait_for_event_count(self, key: str, start_count: int, timeout_sec: float):
+        deadline = time.time() + float(timeout_sec)
+        while rclpy.ok() and time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            values = self.events.get(key, [])
+            if len(values) > start_count:
+                return values[-1]
+        return None
+
+    def request_vision_candidates(self, object_name: str, timeout_sec: float = 20.0) -> dict[str, Any]:
+        if not self.vision_client.wait_for_service(timeout_sec=2.0):
+            return {"ok": False, "reason": "vision_service_unavailable"}
+        start_counts = {key: len(values) for key, values in self.events.items()}
+        request = StringPose.Request()
+        request.data = f"Detect a {object_name.replace('_', ' ')} and return pose"
+        self.get_logger().info(f"Strict target preflight vision request: {request.data}")
+        future = self.vision_client.call_async(request)
+        deadline = time.time() + float(timeout_sec)
+        while rclpy.ok() and time.time() < deadline and not future.done():
+            rclpy.spin_once(self, timeout_sec=0.05)
+        if not future.done() or future.result() is None:
+            return {"ok": False, "reason": "vision_service_timeout"}
+        ranking_event = self.wait_for_event_count("candidate_ranking", start_counts["candidate_ranking"], 1.0)
+        selected_event = self.wait_for_event_count("selected_detection", start_counts["selected_detection"], 0.5)
+        response = future.result()
+        return {
+            "ok": True,
+            "response_text": str(getattr(response, "text", "") or getattr(response, "message", "") or ""),
+            "response_pose": pose_to_dict(getattr(response, "pose", None)),
+            "candidate_ranking_event": ranking_event,
+            "selected_detection_event": selected_event,
+        }
+
+    def candidate_pose(self, candidate: dict[str, Any]):
+        for key in ("selected_grasp_base", "center_base"):
+            pose = dict_to_pose(candidate.get(key))
+            if pose is not None:
+                return pose, key
+        return None, ""
+
+    def nearest_ground_truth_object(self, pose):
+        best_label = None
+        best_xy = None
+        best_xyz = None
+        for label, gt_pose in self.gt_objects.items():
+            xy = xy_distance(pose, gt_pose)
+            if xy is None:
+                continue
+            xyz = pose_distance(pose, gt_pose)
+            if best_xy is None or xy < best_xy:
+                best_label = label
+                best_xy = xy
+                best_xyz = xyz
+        return best_label, best_xy, best_xyz
+
+    def evaluate_strict_target_candidates(self, object_name: str, vision_report: dict[str, Any]) -> dict[str, Any]:
+        event = vision_report.get("candidate_ranking_event") or {}
+        ranking = event.get("data") if isinstance(event, dict) else {}
+        if not isinstance(ranking, dict):
+            ranking = {}
+        candidates = ranking.get("candidates", [])
+        if not isinstance(candidates, list):
+            candidates = []
+        selected_index = ranking.get("selected_index")
+        try:
+            selected_index = int(selected_index)
+        except (TypeError, ValueError):
+            selected_index = 0 if candidates else None
+        target_gt = self.gt_objects.get(object_name)
+        if target_gt is None:
+            return {
+                "passed": False,
+                "reason": "requested_ground_truth_pose_missing",
+                "object": object_name,
+                "available_gt_objects": sorted(self.gt_objects.keys()),
+            }
+        evaluated = []
+        rejected = []
+        for index, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict):
+                continue
+            pose, pose_source = self.candidate_pose(candidate)
+            record = {
+                "index": index,
+                "label": candidate.get("label"),
+                "camera": candidate.get("camera_name", candidate.get("camera")),
+                "final_score": candidate.get("final_score"),
+                "grasp_score": candidate.get("grasp_score"),
+                "pose_source": pose_source,
+                "accepted_by_strict_target": False,
+            }
+            if pose is None:
+                record["reject_reason"] = "candidate_base_pose_missing"
+                rejected.append(record)
+                evaluated.append(record)
+                continue
+            nearest_label, nearest_xy, nearest_xyz = self.nearest_ground_truth_object(pose)
+            target_xy = xy_distance(pose, target_gt)
+            target_xyz = pose_distance(pose, target_gt)
+            record.update({
+                "candidate_base_pose": pose_to_dict(pose),
+                "target_xy_distance_m": target_xy,
+                "target_distance_m": target_xyz,
+                "nearest_object": nearest_label,
+                "nearest_xy_distance_m": nearest_xy,
+                "nearest_distance_m": nearest_xyz,
+                "accepted_by_strict_target": nearest_label == object_name,
+            })
+            if nearest_label != object_name:
+                record["reject_reason"] = "closer_to_another_object"
+                rejected.append(record)
+            evaluated.append(record)
+
+        selected_record = None
+        if selected_index is not None and 0 <= selected_index < len(evaluated):
+            selected_record = evaluated[selected_index]
+        elif evaluated:
+            selected_index = evaluated[0]["index"]
+            selected_record = evaluated[0]
+        selected_ok = bool(selected_record and selected_record.get("accepted_by_strict_target", False))
+        result = {
+            "passed": selected_ok,
+            "reason": "selected_candidate_matches_requested_gt" if selected_ok else "wrong_candidate_selected",
+            "object": object_name,
+            "target_gt_pose": pose_to_dict(target_gt),
+            "selected_index": selected_index,
+            "selected_candidate": selected_record,
+            "evaluated_candidates": evaluated,
+            "rejected_candidates": rejected,
+            "candidate_count": len(candidates),
+        }
+        self.get_logger().info(
+            f"strict_target_candidate_filter: object={object_name}, "
+            f"candidate_count={len(candidates)}, rejected={len(rejected)}, "
+            f"selected_index={selected_index}, selected_ok={selected_ok}"
+        )
+        if not selected_ok:
+            self.get_logger().warn(
+                "wrong_candidate_selected: "
+                f"object={object_name}, selected_index={selected_index}, "
+                f"nearest={None if selected_record is None else selected_record.get('nearest_object')}, "
+                f"target_xy={None if selected_record is None else selected_record.get('target_xy_distance_m')}, "
+                f"nearest_xy={None if selected_record is None else selected_record.get('nearest_xy_distance_m')}"
+            )
+        return result
+
+    def strict_target_preflight(self, object_name: str) -> dict[str, Any]:
+        if not self.strict_target_enabled():
+            return {"enabled": False, "passed": True}
+        if not self.wait_for_ground_truth(object_name):
+            return {
+                "enabled": True,
+                "passed": False,
+                "reason": "ground_truth_unavailable",
+                "object": object_name,
+                "available_gt_objects": sorted(self.gt_objects.keys()),
+            }
+        attempts = []
+        for attempt in range(1, max(1, int(self.args.strict_target_retries)) + 1):
+            vision_report = self.request_vision_candidates(object_name)
+            if not vision_report.get("ok", False):
+                attempt_report = {
+                    "attempt": attempt,
+                    "passed": False,
+                    "reason": vision_report.get("reason", "vision_preflight_failed"),
+                    "vision": vision_report,
+                }
+            else:
+                strict_report = self.evaluate_strict_target_candidates(object_name, vision_report)
+                attempt_report = {
+                    "attempt": attempt,
+                    **strict_report,
+                    "vision": vision_report,
+                }
+            attempts.append(attempt_report)
+            if attempt_report.get("passed", False):
+                self.get_logger().info(
+                    f"strict_target_preflight_passed: object={object_name}, attempt={attempt}"
+                )
+                return {"enabled": True, "passed": True, "attempts": attempts}
+            if attempt < max(1, int(self.args.strict_target_retries)):
+                self.get_logger().warn(
+                    f"wrong_candidate_selected: retry strict target preflight "
+                    f"{attempt + 1}/{max(1, int(self.args.strict_target_retries))}"
+                )
+                self.spin_for(0.3)
+        return {
+            "enabled": True,
+            "passed": False,
+            "reason": "wrong_candidate_selected",
+            "attempts": attempts,
+        }
 
     def wait_for_calibration_event(self, object_name: str, start_count: int, timeout_sec: float):
         deadline = time.time() + float(timeout_sec)
@@ -186,6 +426,9 @@ def parse_args():
     parser.add_argument("--yaw-modes", default=None)
     parser.add_argument("--velocity-scales", default=None)
     parser.add_argument("--use-gt-eval", action="store_true")
+    parser.add_argument("--strict-target", action="store_true")
+    parser.add_argument("--strict-target-retries", type=int, default=2)
+    parser.add_argument("--vision-service", default="detect_objects_with_prompt")
     parser.add_argument("--attempts-per-value", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=100.0)
     parser.add_argument("--out-root", default=str(DEFAULT_OUT_ROOT))
@@ -256,7 +499,7 @@ def main():
     rclpy.init()
     node = CalibrationRunner(args)
     node.current_attempt_dir = out_dir
-    node.set_dry_run(args.dry_run)
+    node.log_runtime_configuration_note()
     node.spin_for(1.0)
 
     reports = []
@@ -280,10 +523,34 @@ def main():
                     "dry_run": args.dry_run,
                     "no_place": args.no_place,
                     "use_gt_eval": args.use_gt_eval,
+                    "strict_target": bool(args.strict_target),
                     "seed": args.seed,
                 }
                 start_count = len(node.events["grasp_calibration_debug"])
                 node.publish_override(object_name, close_pos, z_offset, yaw_mode, velocity_scale, args.no_place)
+                strict_report = node.strict_target_preflight(object_name)
+                metadata["strict_target_report"] = strict_report
+                if not strict_report.get("passed", True):
+                    event = {
+                        "time": time.time(),
+                        "data": {
+                            "object": object_name,
+                            "wrong_candidate_selected": True,
+                            "strict_target_report": strict_report,
+                            "result": {
+                                "pick_success": False,
+                                "failure_reason": strict_report.get("reason", "strict_target_preflight_failed"),
+                            },
+                        },
+                    }
+                    report = node.save_attempt(attempt_dir, metadata, event)
+                    reports.append(report)
+                    node.get_logger().warn(
+                        f"wrong_candidate_selected: object={object_name}, attempt={attempt_index}; "
+                        "not executing pick command and continuing sweep."
+                    )
+                    node.spin_for(0.5)
+                    continue
                 node.publish_command(object_name, args.target)
                 event = node.wait_for_calibration_event(object_name, start_count, args.timeout)
                 report = node.save_attempt(attempt_dir, metadata, event)
