@@ -40,6 +40,7 @@ class DepthColorProposalBackend:
         target_label: str,
         camera_name: str,
         query_stage: str = "depth_cluster_fallback",
+        strict_semantic_prompts: bool = True,
     ) -> list[Detection]:
         xyz = pointcloud2_to_xyz_image(cloud_msg)
         if image_bgr is None or xyz is None:
@@ -171,6 +172,7 @@ class OwlVitBackend:
         target_label: str,
         camera_name: str,
         query_stage: str = "normal_target_detection",
+        strict_semantic_prompts: bool = True,
     ) -> list[Detection]:
         try:
             self._load()
@@ -185,7 +187,11 @@ class OwlVitBackend:
         import cv2
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         pil = self.PILImage.fromarray(image_rgb)
-        queries = detector_queries_for_target(target_label, stage=query_stage)
+        queries = detector_queries_for_target(
+            target_label,
+            stage=query_stage,
+            strict_semantic_prompts=bool(strict_semantic_prompts),
+        )
         if not queries:
             return []
 
@@ -303,7 +309,7 @@ def make_backend(name: str, params: dict):
             model_id=params.get("grounding_dino_model_id", "IDEA-Research/grounding-dino-base"),
             text_prompt=params.get(
                 "grounding_dino_text_prompt",
-                "coke can. meat can. banana. hammer. strawberry.",
+                "red cylindrical soda can. rectangular spam-like meat can. banana. hammer with long handle. strawberry.",
             ),
             box_threshold=params.get("grounding_dino_box_threshold", 0.25),
             text_threshold=params.get("grounding_dino_text_threshold", 0.20),

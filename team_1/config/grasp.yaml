@@ -72,21 +72,27 @@ object_grasp_profiles:
     lift_duration: 2.2
 
   hammer:
-    strategy: handle_grasp
+    strategy: hammer_handle_grasp
     close_pos: 0.75
     close_timeout: 3.0
-    approach_height: 0.16
-    grasp_z_offset: -0.012
-    vision_grasp_z_offset: 0.0
+    approach_height: 0.14
+    grasp_z_offset: -0.006
+    vision_grasp_z_offset: -0.006
     vision_grasp_z_min: -0.045
     vision_grasp_z_max: 0.040
-    lift_height: 0.22
+    lift_height: 0.12
     yaw_mode: handle_axis
     risk: high
+    velocity_scale: 0.45
+    acceleration_scale: 0.45
     approach_duration: 3.2
     descent_duration: 2.8
     lift_duration: 3.2
     post_close_sleep: 0.35
+    min_candidate_score: 0.25
+    min_grasp_score: 0.80
+    require_handle_region: true
+    skip_if_uncertain: true
     use_vision_grasp_orientation: true
 
 banana:
@@ -107,13 +113,20 @@ banana:
   approach_height: 0.18
 
 hammer:
-  strategy: handle_grasp
-  candidate_offsets_along_axis: [-0.08, -0.05, -0.025, 0.0, 0.025, 0.05, 0.08]
-  candidate_yaw_offsets: [0.0, 1.5708]
+  strategy: hammer_handle_grasp
+  candidate_offsets_along_axis: [0.0]
+  candidate_yaw_offsets: [0.0]
   max_handle_width: 0.065
+  min_length_width_ratio: 1.85
+  min_handle_score: 0.48
+  min_candidate_score: 0.25
+  min_grasp_score: 0.80
+  require_handle_region: true
+  skip_if_uncertain: true
   use_largest_cluster: false
   surface_depth_offset: 0.0
-  approach_height: 0.16
+  approach_height: 0.14
+  lift_height: 0.12
 
 coke_can:
   strategy: can_side_or_top_center
@@ -123,7 +136,7 @@ coke_can:
   upper_body_percentile: 18.0
   max_gripper_width: 0.075
   surface_depth_offset: 0.0
-  aliases: ["cola can", "red soda can", "red can"]
+  aliases: ["red cylindrical soda can", "red cola can", "red coke can", "cylindrical red can"]
 
 meat_can:
   strategy: can_side_or_top_center
@@ -133,7 +146,7 @@ meat_can:
   upper_body_percentile: 18.0
   max_gripper_width: 0.075
   surface_depth_offset: 0.0
-  aliases: ["tin can", "food can", "canned food"]
+  aliases: ["rectangular meat can", "square meat can", "spam can", "rectangular food can", "canned meat"]
 
 strawberry:
   strategy: compact_top_center

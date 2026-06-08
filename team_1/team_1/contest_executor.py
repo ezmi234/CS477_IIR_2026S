@@ -18,6 +18,8 @@ from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 
 from .config import (
+    COMPETITION_POLICY,
+    HAMMER_POLICY,
     HOME_JOINTS,
     LOW_RISK_ONLY_AFTER_SEC,
     MIN_CONFIDENCE,
@@ -105,6 +107,8 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.current_object_pose = None
         self.current_pick_plan = None
         self.current_pick_info = None
+        self.current_attempt_type = ''
+        self.current_failure_reason = None
         self.current_task_start_time = None
         self.current_detection_start_time = None
         self.current_detection_time = 0.0
@@ -122,6 +126,8 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.js_joint_name = None
         self.place_counts = {destination: 0 for destination in PLACE_CONFIGS}
         self.calibration_profile_overrides = {}
+        self.requested_object_order = []
+        self.requested_objects = {}
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -133,6 +139,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.motion_debug_pub = self.create_publisher(String, '/motion/debug', 10)
         self.ik_debug_pub = self.create_publisher(String, '/motion/ik_debug', 10)
         self.grasp_calibration_debug_pub = self.create_publisher(String, '/motion/grasp_calibration_debug', 10)
+        self.execution_summary_pub = self.create_publisher(String, '/team_1/execution_summary', 10)
         self.create_subscription(String, '/team_1/calibration_override', self.calibration_override_callback, 10)
         self.create_subscription(String, '/motion/grasp_profile_override', self.grasp_profile_override_callback, 10)
 
@@ -403,6 +410,21 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
 
     def run_fsm_once(self):
         self.poll_prefetch()
+        if (
+            self.current_task is not None
+            and self.current_task_start_time is not None
+            and self.state not in {ExecutorState.STANDBY, ExecutorState.DONE}
+        ):
+            stuck_limit = float(COMPETITION_POLICY.get('stop_if_robot_stuck_sec', 80.0) or 80.0)
+            if time.monotonic() - float(self.current_task_start_time) > stuck_limit:
+                self.get_logger().error(
+                    f'Stuck policy triggered for {self.current_task.label()}: '
+                    f'task_runtime>{stuck_limit:.1f}s. Aborting this task safely.'
+                )
+                self.mark_skip_reason(self.current_task, 'unsafe_stuck_timeout')
+                self.finish_task(success=False)
+                self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
+                return
 
         if self.state == ExecutorState.STANDBY:
             if self.command_queue:
@@ -423,6 +445,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 self.get_logger().error(f'Could not parse any tasks: {self.current_command}')
                 self.transition_to(ExecutorState.DONE)
                 return
+            self.start_requested_object_tracking(self.current_parsed_tasks)
             self.transition_to(ExecutorState.BUILD_TASK_QUEUE)
             return
 
@@ -460,6 +483,8 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             self.current_detection_time = 0.0
             self.current_grasp_plan_time = 0.0
             self.current_motion_time = 0.0
+            self.current_attempt_type = ''
+            self.current_failure_reason = None
             self.get_logger().info(f'Start task: {self.current_task.label()}')
             self.log_elapsed_time()
             if self.should_skip_task_before_pose(self.current_task):
@@ -483,15 +508,21 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 f'Timing {self.current_task.object_name}: detection_time={self.current_detection_time:.3f}s'
             )
             if self.current_object_pose is None:
+                will_defer = self.task_planner.should_defer_pose_failure(
+                    self.current_task,
+                    len(self.task_queue),
+                )
+                self.mark_detection_failed(
+                    self.current_task,
+                    pending_retry=will_defer,
+                    reason='detection_failed',
+                )
                 if OBJECT_RISK.get(self.current_task.object_name, 'medium') == 'low':
                     self.get_logger().warn(
                         f'target_detection_failed: target={self.current_task.object_name}, '
                         'pose provider returned no usable pose.'
                     )
-                if self.task_planner.should_defer_pose_failure(
-                    self.current_task,
-                    len(self.task_queue),
-                ):
+                if will_defer:
                     deferred = self.task_planner.defer_failed_task(self.current_task)
                     self.task_queue.append(deferred)
                     if OBJECT_RISK.get(self.current_task.object_name, 'medium') == 'low':
@@ -506,6 +537,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                         f'Queue depth: {len(self.task_queue)}'
                     )
                     self.clear_current_task()
+                    self.log_requested_object_status()
                 else:
                     self.get_logger().error(
                         f'Skipping {self.current_task.object_name}: pose provider failed.'
@@ -513,6 +545,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                     self.finish_task(success=False)
                 self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
                 return
+            self.mark_candidate_generated(self.current_task)
             if not self.is_reachable_pick_pose(self.current_object_pose):
                 self.get_logger().error(
                     'Skipping unreachable/invalid pick pose for '
@@ -521,11 +554,17 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                     f'y={self.current_object_pose.position.y:.3f}, '
                         f'z={self.current_object_pose.position.z:.3f}'
                 )
+                requeued_unreachable = False
                 if OBJECT_RISK.get(self.current_task.object_name, 'medium') == 'low':
-                    self.requeue_low_risk_for_scene_change(
+                    requeued_unreachable = self.requeue_low_risk_for_scene_change(
                         self.current_task,
                         'unreachable/invalid low-risk pose',
                     )
+                self.mark_skip_reason(
+                    self.current_task,
+                    'unreachable_candidate',
+                    pending_retry=requeued_unreachable,
+                )
                 self.finish_task(success=False)
                 self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
                 return
@@ -547,6 +586,8 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 self.current_grasp_plan_time = time.monotonic() - started
                 self.get_logger().error(f'Grasp planning failed: {self.current_task.label()}: {exc}')
                 failed_task = self.current_task
+                self.current_failure_reason = 'grasp_planning_failed'
+                self.mark_skip_reason(failed_task, 'grasp_planning_failed')
                 self.finish_task(success=False)
                 if OBJECT_RISK.get(failed_task.object_name, 'medium') == 'low':
                     self.requeue_low_risk_for_scene_change(failed_task, 'low-risk grasp planning failed')
@@ -562,15 +603,40 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         if self.state == ExecutorState.PICK:
             try:
                 started = time.monotonic()
+                self.mark_pick_attempt_started(self.current_task)
                 self.current_pick_info = self.execute_pick(
                     self.current_task.object_name,
                     self.current_pick_plan,
                 )
+                self.mark_lift_result(self.current_task, self.current_pick_info)
                 self.current_motion_time += time.monotonic() - started
+                if bool((self.current_pick_info or {}).get('abort_place', False)):
+                    failed_task = self.current_task
+                    reason = (self.current_pick_info or {}).get(
+                        'lift_verification_reason',
+                        'object_not_lifted',
+                    )
+                    self.get_logger().warn(
+                        f'Aborting placement for {failed_task.label()}: {reason}.'
+                    )
+                    self.current_failure_reason = 'object_not_lifted'
+                    self.mark_place_result(
+                        failed_task,
+                        False,
+                        executed=False,
+                        reason='object_not_lifted',
+                    )
+                    self.finish_task(success=False)
+                    if self.home_ready:
+                        self.requeue_task_for_retry(failed_task, 'object not lifted after safe uncertain attempt')
+                    self.transition_to(ExecutorState.CHECK_TASK_QUEUE)
+                    return
                 self.transition_to(ExecutorState.PLACE)
             except Exception as exc:
                 self.get_logger().error(f'Pick failed: {self.current_task.label()}: {exc}')
                 failed_task = self.current_task
+                self.current_failure_reason = 'pick_failed'
+                self.mark_skip_reason(failed_task, 'pick_failed')
                 self.finish_task(success=False)
                 if self.home_ready:
                     self.requeue_task_for_retry(failed_task, 'pick failed after safe recovery')
@@ -607,6 +673,13 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             except Exception as exc:
                 self.get_logger().error(f'Place failed: {self.current_task.label()}: {exc}')
                 success = False
+                self.current_failure_reason = 'place_failed'
+            self.mark_place_result(
+                self.current_task,
+                success,
+                executed=True,
+                reason=None if success else (self.current_failure_reason or 'place_failed'),
+            )
             self.finish_task(success=success)
             if not success and self.home_ready:
                 self.requeue_task_for_retry(placed_task, 'place/completion failed after safe recovery')
@@ -671,6 +744,260 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             f'Command elapsed={elapsed:.1f}s, remaining_budget={remaining:.1f}s'
         )
 
+    def remaining_command_time(self):
+        return max(0.0, TRIAL_TIME_LIMIT_SEC - self.elapsed_command_time())
+
+    def start_requested_object_tracking(self, tasks):
+        self.requested_object_order = []
+        self.requested_objects = {}
+        for task in tasks:
+            status = self.ensure_requested_object_status(task.object_name)
+            destination = str(task.destination)
+            if destination and destination not in status['destinations']:
+                status['destinations'].append(destination)
+        self.log_requested_object_status()
+
+    def ensure_requested_object_status(self, object_name):
+        object_name = str(object_name or '').strip().lower().replace(' ', '_')
+        if object_name not in self.requested_objects:
+            self.requested_object_order.append(object_name)
+            self.requested_objects[object_name] = {
+                'requested': True,
+                'destinations': [],
+                'attempted': False,
+                'attempt_count': 0,
+                'success': False,
+                'skipped': False,
+                'detection_failed': False,
+                'candidate_generated': False,
+                'pick_attempted': False,
+                'pick_executed': False,
+                'lift_success': False,
+                'place_success': False,
+                'place_executed': False,
+                'wrong_object_risk': False,
+                'retry_count': 0,
+                'skipped_reason': None,
+                'last_failure_reason': None,
+                'failure_reason': None,
+                'last_attempt_type': None,
+                'attempt_type': None,
+                'detection_stage': None,
+                'candidate_source': None,
+                'fail_open_used': False,
+                'semantic_detection_failed': False,
+                'policy_attempt_required': False,
+                'last_update_time': None,
+            }
+        return self.requested_objects[object_name]
+
+    def mark_requested_object_status(self, task_or_name, **updates):
+        object_name = getattr(task_or_name, 'object_name', task_or_name)
+        status = self.ensure_requested_object_status(object_name)
+        for key, value in updates.items():
+            status[key] = value
+        status['last_update_time'] = time.time()
+        return status
+
+    def detection_metadata_for_status(self):
+        quality = self.detection_quality_for_current_task()
+        detection_stage = str(quality.get('detection_stage') or 'normal_target_detection')
+        candidate_source = detection_stage
+        if detection_stage == 'depth_cluster_fallback':
+            candidate_source = 'depth_cluster'
+        elif detection_stage == 'generic_object_proposal':
+            candidate_source = 'generic_object'
+        elif detection_stage == 'relaxed_alias_detection':
+            candidate_source = 'relaxed_semantic'
+        else:
+            backend = quality.get('detection', {}).get('backend')
+            candidate_source = str(backend or 'target_semantic')
+        return quality, {
+            'detection_stage': detection_stage,
+            'candidate_source': candidate_source,
+            'fail_open_used': bool(quality.get('fail_open_used', False)),
+            'semantic_detection_failed': bool(
+                quality.get('detection', {}).get(
+                    'semantic_detection_failed',
+                    detection_stage != 'normal_target_detection',
+                )
+            ),
+        }
+
+    def mark_candidate_generated(self, task):
+        quality, metadata = self.detection_metadata_for_status()
+        policy_required = self.is_minimum_attempt_required_for_object(task.object_name)
+        self.mark_requested_object_status(
+            task,
+            candidate_generated=True,
+            policy_attempt_required=bool(policy_required),
+            **metadata,
+        )
+        return quality
+
+    def mark_detection_failed(self, task, *, pending_retry=False, reason='detection_failed'):
+        self.current_failure_reason = reason
+        status = self.ensure_requested_object_status(task.object_name)
+        self.mark_requested_object_status(
+            task,
+            detection_failed=True,
+            skipped=not bool(pending_retry),
+            skipped_reason=None if pending_retry else reason,
+            last_failure_reason='pending_retry' if pending_retry else reason,
+            failure_reason='pending_retry' if pending_retry else reason,
+            retry_count=max(
+                int(status.get('retry_count', 0) or 0),
+                int(getattr(task, 'attempt', 0)) + (1 if pending_retry else 0),
+            ),
+        )
+
+    def mark_skip_reason(self, task, reason, *, wrong_object_risk=False, pending_retry=False):
+        self.current_failure_reason = reason
+        self.mark_requested_object_status(
+            task,
+            skipped=not bool(pending_retry),
+            skipped_reason=None if pending_retry else reason,
+            last_failure_reason='pending_retry' if pending_retry else reason,
+            failure_reason='pending_retry' if pending_retry else reason,
+            wrong_object_risk=bool(wrong_object_risk)
+            or self.ensure_requested_object_status(task.object_name).get('wrong_object_risk', False),
+            retry_count=max(
+                int(self.ensure_requested_object_status(task.object_name).get('retry_count', 0) or 0),
+                int(getattr(task, 'attempt', 0)) + (1 if pending_retry else 0),
+            ),
+        )
+
+    def mark_pick_attempt_started(self, task):
+        if not self.current_attempt_type:
+            self.current_attempt_type = 'normal_quality_attempt'
+        status = self.ensure_requested_object_status(task.object_name)
+        new_count = int(status.get('attempt_count', 0) or 0) + 1
+        quality, metadata = self.detection_metadata_for_status()
+        del quality
+        self.mark_requested_object_status(
+            task,
+            attempted=True,
+            attempt_count=new_count,
+            pick_attempted=True,
+            pick_executed=True,
+            skipped=False,
+            skipped_reason=None,
+            last_attempt_type=self.current_attempt_type,
+            attempt_type=self.current_attempt_type,
+            policy_attempt_required=bool(self.is_minimum_attempt_required_for_object(task.object_name)),
+            **metadata,
+        )
+        self.get_logger().info(
+            f'Attempt started: object={task.object_name}, attempt_count={new_count}, '
+            f'attempt_type={self.current_attempt_type}, detection_stage={metadata["detection_stage"]}, '
+            f'candidate_source={metadata["candidate_source"]}'
+        )
+
+    def mark_lift_result(self, task, pick_info):
+        lift_verified = bool((pick_info or {}).get('lift_verified', True))
+        reason = (pick_info or {}).get('lift_verification_reason')
+        self.mark_requested_object_status(
+            task,
+            lift_success=lift_verified,
+            last_failure_reason=None if lift_verified else (reason or 'object_not_lifted'),
+            failure_reason=None if lift_verified else (reason or 'object_not_lifted'),
+        )
+
+    def mark_place_result(self, task, success, *, executed=True, reason=None):
+        self.mark_requested_object_status(
+            task,
+            place_executed=bool(executed),
+            place_success=bool(success),
+            success=bool(success),
+            skipped=False,
+            skipped_reason=None,
+            last_failure_reason=None if success else (reason or self.current_failure_reason or 'place_failed'),
+            failure_reason=None if success else (reason or self.current_failure_reason or 'place_failed'),
+        )
+
+    def is_minimum_attempt_required_for_object(self, object_name):
+        if not bool(COMPETITION_POLICY.get('ensure_attempt_for_each_requested_object', True)):
+            return False
+        status = self.requested_objects.get(str(object_name or '').strip().lower().replace(' ', '_'))
+        if not status or not bool(status.get('requested', False)):
+            return False
+        min_attempts = int(COMPETITION_POLICY.get('min_attempts_per_requested_object', 1) or 1)
+        return int(status.get('attempt_count', 0) or 0) < max(1, min_attempts)
+
+    def safe_attempt_time_available(self, object_name):
+        if str(object_name) == 'hammer':
+            threshold = float(HAMMER_POLICY.get(
+                'skip_if_time_remaining_below_sec',
+                COMPETITION_POLICY.get('min_time_remaining_for_safe_attempt_sec', 45.0),
+            ))
+        else:
+            threshold = float(COMPETITION_POLICY.get('min_time_remaining_for_safe_attempt_sec', 45.0))
+        return self.remaining_command_time() >= threshold
+
+    def should_force_minimum_uncertain_attempt(self, task, quality, weak_candidate):
+        if not bool(COMPETITION_POLICY.get('allow_uncertain_attempt_if_no_better_candidate', True)):
+            return False
+        if not bool(weak_candidate):
+            return False
+        if not self.is_minimum_attempt_required_for_object(task.object_name):
+            return False
+        if not self.safe_attempt_time_available(task.object_name):
+            self.mark_skip_reason(task, 'time_remaining_too_low_for_safe_attempt')
+            return False
+        if not bool(quality.get('base_link_pose_exists', False)):
+            return False
+        if task.object_name == 'hammer':
+            if not bool(HAMMER_POLICY.get('attempt_if_requested', True)):
+                return False
+            grasp_score = float(quality.get('grasp_score', 0.0) or 0.0)
+            pose_is_grasp = bool(getattr(self.pose_provider, 'latest_pose_is_grasp', False))
+            if grasp_score <= 0.0 and not pose_is_grasp:
+                self.mark_skip_reason(task, 'no_hammer_grasp_candidate')
+                return False
+        return True
+
+    def log_requested_object_status(self):
+        if not self.requested_objects:
+            return
+        self.get_logger().info('Requested object status:')
+        for object_name in self.requested_object_order:
+            status = self.requested_objects.get(object_name, {})
+            reason = status.get('failure_reason') or status.get('skipped_reason') or status.get('last_failure_reason')
+            reason_text = f' reason={reason}' if reason else ''
+            self.get_logger().info(
+                f'{object_name}: attempted={bool(status.get("attempted", False))} '
+                f'success={bool(status.get("success", False))} '
+                f'attempt_count={int(status.get("attempt_count", 0) or 0)}'
+                f'{reason_text}'
+            )
+
+    def execution_summary_payload(self):
+        objects = {}
+        for object_name in self.requested_object_order:
+            status = dict(self.requested_objects.get(object_name, {}))
+            status.pop('last_update_time', None)
+            objects[object_name] = status
+        return {
+            'requested_objects': list(self.requested_object_order),
+            'objects': objects,
+            'policy': 'ensure_one_attempt_per_requested_object',
+            'competition_policy': dict(COMPETITION_POLICY),
+            'elapsed_sec': float(self.elapsed_command_time()),
+            'remaining_sec': float(self.remaining_command_time()),
+            'ground_truth_used': self.pose_provider_name == 'ground_truth',
+        }
+
+    def publish_execution_summary(self):
+        if not self.requested_objects:
+            return
+        payload = self.execution_summary_payload()
+        text = json.dumps(payload)
+        try:
+            self.execution_summary_pub.publish(String(data=text))
+        except Exception:
+            pass
+        self.get_logger().info(f'Execution summary: {text}')
+
     def task_prefetch_key(self, task):
         if task is None:
             return None
@@ -688,6 +1015,8 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             return False
         request = StringPose.Request()
         request.data = f'Detect a {task.object_name.replace("_", " ")} and return pose'
+        if self.is_minimum_attempt_required_for_object(task.object_name):
+            request.data += ' attempt_required_by_policy'
         try:
             future = self.detect_client.call_async(request)
         except Exception as exc:
@@ -846,21 +1175,39 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
 
     def should_skip_task_before_pose(self, task):
         elapsed = self.elapsed_command_time()
+        remaining = self.remaining_command_time()
         risk = OBJECT_RISK.get(task.object_name, 'medium')
-        if elapsed > TRIAL_TIME_LIMIT_SEC - 20.0:
+        safe_threshold = float(COMPETITION_POLICY.get('min_time_remaining_for_safe_attempt_sec', 45.0))
+        if self.is_minimum_attempt_required_for_object(task.object_name):
+            safe_threshold = max(20.0, safe_threshold)
+        else:
+            safe_threshold = 20.0
+        if remaining < safe_threshold:
             self.get_logger().warn(
-                f'Skipping {task.label()}: less than 20 seconds remain in trial budget.'
+                f'Skipping {task.label()}: only {remaining:.1f}s remain; '
+                f'safe threshold is {safe_threshold:.1f}s.'
             )
+            self.mark_skip_reason(task, 'time_remaining_too_low_for_safe_attempt')
             return True
-        if elapsed > SKIP_HAMMER_AFTER_SEC and task.object_name == 'hammer':
+        if (
+            elapsed > SKIP_HAMMER_AFTER_SEC
+            and task.object_name == 'hammer'
+            and not self.is_minimum_attempt_required_for_object(task.object_name)
+        ):
             self.get_logger().warn(
                 f'Skipping hammer after {elapsed:.1f}s: high-risk object deferred by policy.'
             )
+            self.mark_skip_reason(task, 'hammer_retry_skipped_after_time_policy')
             return True
-        if elapsed > LOW_RISK_ONLY_AFTER_SEC and risk != 'low':
+        if (
+            elapsed > LOW_RISK_ONLY_AFTER_SEC
+            and risk != 'low'
+            and not self.is_minimum_attempt_required_for_object(task.object_name)
+        ):
             self.get_logger().warn(
                 f'Skipping {task.label()} after {elapsed:.1f}s: only low-risk tasks run after 7 minutes.'
             )
+            self.mark_skip_reason(task, 'late_non_low_risk_retry_skipped')
             return True
         return False
 
@@ -951,16 +1298,25 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         fail_open_used = bool(quality.get('fail_open_used', False))
         transform_mode = quality.get('transform_mode') or 'unknown'
         base_link_pose_exists = bool(quality.get('base_link_pose_exists', False))
+        minimum_attempt_required = self.is_minimum_attempt_required_for_object(task.object_name)
 
         self.get_logger().info(
             f'Quality gate for {task.object_name}: semantic={semantic_score:.3f}/{min_score:.3f}, '
             f'final={final_score:.3f}/{min_final:.3f}, grasp={grasp_score:.3f}/{min_grasp:.3f}, '
             f'risk={risk}, selected_camera={selected_camera}, transform_mode={transform_mode}, '
             f'detection_stage={detection_stage}, fail_open_used={fail_open_used}, '
-            f'base_link_pose_exists={base_link_pose_exists}'
+            f'base_link_pose_exists={base_link_pose_exists}, '
+            f'minimum_attempt_required={minimum_attempt_required}'
         )
 
         if quality['verification_accepted'] is False:
+            will_retry = risk == 'low' and self.task_planner.should_retry_task_failure(task)
+            self.mark_skip_reason(
+                task,
+                'wrong_object_risk',
+                wrong_object_risk=True,
+                pending_retry=will_retry,
+            )
             self.get_logger().warn(
                 f'Quality gate decision: target={task.object_name}, decision=skip, '
                 f'reason=verifier_rejected_shape, camera={selected_camera}, '
@@ -989,6 +1345,22 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         )
 
         if task.object_name == 'hammer' and weak_candidate:
+            if self.should_force_minimum_uncertain_attempt(task, quality, weak_candidate):
+                self.current_attempt_type = 'safe_uncertain_attempt'
+                self.mark_requested_object_status(
+                    task,
+                    policy_attempt_required=True,
+                    attempt_type=self.current_attempt_type,
+                    last_attempt_type=self.current_attempt_type,
+                )
+                self.get_logger().warn(
+                    f'Quality gate decision: target={task.object_name}, decision=execute, '
+                    f'reason=minimum_required_safe_uncertain_hammer_attempt, camera={selected_camera}, '
+                    f'transform_mode={transform_mode}, detection_stage={detection_stage}, '
+                    f'final={final_score:.3f}/{min_final:.3f}, grasp={grasp_score:.3f}/{min_grasp:.3f}'
+                )
+                return False
+            self.mark_skip_reason(task, 'weak_hammer_candidate')
             self.get_logger().warn(
                 f'Quality gate decision: target={task.object_name}, decision=skip, '
                 f'reason=weak_hammer_candidate, camera={selected_camera}, '
@@ -1008,7 +1380,11 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 and not low_risk_quality_override
                 and not low_risk_high_grasp_override
             )
+        ) and not (
+            minimum_attempt_required
+            and self.safe_attempt_time_available(task.object_name)
         ):
+            self.mark_skip_reason(task, 'time_low_quality_gate')
             self.get_logger().warn(
                 f'Quality gate decision: target={task.object_name}, decision=skip, '
                 f'reason=time_low_quality_gate, camera={selected_camera}, '
@@ -1021,6 +1397,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
 
         if risk == 'low' and weak_candidate:
             if fail_open_used and base_link_pose_exists and grasp_score >= min_grasp:
+                self.current_attempt_type = 'safe_uncertain_attempt'
                 self.get_logger().warn(
                     f'attempting_uncertain_low_risk_pick: target={task.object_name}, '
                     f'detection_stage={detection_stage}, final={final_score:.3f}/{min_final:.3f}, '
@@ -1032,7 +1409,23 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                     f'transform_mode={transform_mode}, detection_stage={detection_stage}'
                 )
                 return False
+            if self.should_force_minimum_uncertain_attempt(task, quality, weak_candidate):
+                self.current_attempt_type = 'safe_uncertain_attempt'
+                self.mark_requested_object_status(
+                    task,
+                    policy_attempt_required=True,
+                    attempt_type=self.current_attempt_type,
+                    last_attempt_type=self.current_attempt_type,
+                )
+                self.get_logger().warn(
+                    f'Quality gate decision: target={task.object_name}, decision=execute, '
+                    f'reason=minimum_required_safe_uncertain_attempt, camera={selected_camera}, '
+                    f'transform_mode={transform_mode}, detection_stage={detection_stage}, '
+                    f'final={final_score:.3f}/{min_final:.3f}, grasp={grasp_score:.3f}/{min_grasp:.3f}'
+                )
+                return False
             if low_risk_quality_override:
+                self.current_attempt_type = 'normal_quality_attempt'
                 self.get_logger().info(
                     f'Quality gate decision: target={task.object_name}, decision=execute, '
                     f'reason=low_risk_semantic_grasp_pass_despite_low_final, camera={selected_camera}, '
@@ -1041,6 +1434,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 )
                 return False
             if low_risk_high_grasp_override:
+                self.current_attempt_type = 'normal_quality_attempt'
                 self.get_logger().info(
                     f'Quality gate decision: target={task.object_name}, decision=execute, '
                     f'reason=low_risk_strong_grasp_plausible_semantic, camera={selected_camera}, '
@@ -1058,12 +1452,29 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 f'(semantic={semantic_score:.3f}, final={final_score:.3f}, grasp={grasp_score:.3f}).'
             )
             self.requeue_low_risk_for_scene_change(task, 'weak low-risk quality gate')
+            self.mark_skip_reason(task, 'weak_low_risk_quality_gate', pending_retry=self.task_planner.should_retry_task_failure(task))
             return True
 
         if risk != 'low' and weak_candidate:
+            if self.should_force_minimum_uncertain_attempt(task, quality, weak_candidate):
+                self.current_attempt_type = 'safe_uncertain_attempt'
+                self.mark_requested_object_status(
+                    task,
+                    policy_attempt_required=True,
+                    attempt_type=self.current_attempt_type,
+                    last_attempt_type=self.current_attempt_type,
+                )
+                self.get_logger().warn(
+                    f'Quality gate decision: target={task.object_name}, decision=execute, '
+                    f'reason=minimum_required_safe_uncertain_attempt, camera={selected_camera}, '
+                    f'transform_mode={transform_mode}, detection_stage={detection_stage}, '
+                    f'final={final_score:.3f}/{min_final:.3f}, grasp={grasp_score:.3f}/{min_grasp:.3f}'
+                )
+                return False
             if self.task_planner.should_defer_pose_failure(task, len(self.task_queue)):
                 deferred = self.task_planner.defer_failed_task(task)
                 self.task_queue.append(deferred)
+                self.mark_skip_reason(task, 'defer_weak_medium_high_risk_candidate', pending_retry=True)
                 self.get_logger().warn(
                     f'Quality gate decision: target={task.object_name}, decision=skip, '
                     f'reason=defer_weak_medium_high_risk_candidate, camera={selected_camera}, '
@@ -1074,6 +1485,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                     f'(semantic={semantic_score:.3f}, final={final_score:.3f}, grasp={grasp_score:.3f}).'
                 )
             else:
+                self.mark_skip_reason(task, 'weak_medium_high_risk_candidate')
                 self.get_logger().warn(
                     f'Quality gate decision: target={task.object_name}, decision=skip, '
                     f'reason=weak_medium_high_risk_candidate, camera={selected_camera}, '
@@ -1084,6 +1496,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                 )
             return True
 
+        self.current_attempt_type = 'safe_uncertain_attempt' if fail_open_used else 'normal_quality_attempt'
         self.get_logger().info(
             f'Quality gate decision: target={task.object_name}, decision=execute, '
             f'reason=quality_pass, camera={selected_camera}, transform_mode={transform_mode}, '
@@ -1218,6 +1631,15 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
 
         deferred = self.task_planner.defer_failed_task(task)
         self.task_queue.append(deferred)
+        status = self.ensure_requested_object_status(task.object_name)
+        self.mark_requested_object_status(
+            task,
+            retry_count=max(int(status.get('retry_count', 0) or 0), int(deferred.attempt)),
+            skipped=False,
+            skipped_reason=None,
+            last_failure_reason='pending_retry',
+            failure_reason='pending_retry',
+        )
         self.get_logger().warn(
             f'Retrying task later because {reason}: {task.label()} '
             f'(attempt {task.attempt + 1}/'
@@ -1239,6 +1661,32 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
             self.get_logger().error(f'Failed to return home after task: {exc}')
         finally:
             if self.current_task is not None:
+                status = self.ensure_requested_object_status(self.current_task.object_name)
+                if success:
+                    self.mark_requested_object_status(
+                        self.current_task,
+                        success=True,
+                        skipped=False,
+                        skipped_reason=None,
+                        last_failure_reason=None,
+                        failure_reason=None,
+                    )
+                elif not bool(status.get('attempted', False)):
+                    reason = self.current_failure_reason or status.get('failure_reason') or 'skipped_before_motion'
+                    self.mark_requested_object_status(
+                        self.current_task,
+                        skipped=True,
+                        skipped_reason=reason,
+                        last_failure_reason=reason,
+                        failure_reason=reason,
+                    )
+                elif not status.get('failure_reason'):
+                    reason = self.current_failure_reason or 'attempt_failed'
+                    self.mark_requested_object_status(
+                        self.current_task,
+                        last_failure_reason=reason,
+                        failure_reason=reason,
+                    )
                 status = 'complete' if success else 'failed/skipped'
                 total_task_time = (
                     time.monotonic() - self.current_task_start_time
@@ -1255,6 +1703,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
                     f'motion_time={self.current_motion_time:.3f}s, '
                     f'total_task_time={total_task_time:.3f}s'
                 )
+                self.log_requested_object_status()
             self.clear_current_task()
 
     def clear_current_task(self):
@@ -1262,6 +1711,8 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.current_object_pose = None
         self.current_pick_plan = None
         self.current_pick_info = None
+        self.current_attempt_type = ''
+        self.current_failure_reason = None
         self.current_task_start_time = None
 
     def finish_command(self):
@@ -1279,6 +1730,7 @@ class ContestExecutor(MotionMixin, PickPlaceMixin, Node):
         self.current_parsed_tasks = []
         self.current_scene_snapshot = None
         self.discard_prefetch('command finished')
+        self.publish_execution_summary()
         self.command_start_time = None
         self.startup_observe_done = False
         self.get_logger().info('FSM done. Standby: waiting for /task_commands')

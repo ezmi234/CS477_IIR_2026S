@@ -27,6 +27,7 @@
     backend_order: ["hf_owlvit"]
     allow_backend_fallback: true
     backend_debug: true
+    strict_semantic_prompts: true
     save_debug_images: false
     debug_dir: "/home/ubuntu/cs477_ws/debug_runs/vision_debug"
     future_backend_order: ["hf_owlvit"]
@@ -38,14 +39,14 @@
     ranking_request_budget_sec: 1.0
     grounding_dino_enabled: false
     grounding_dino_model_id: "IDEA-Research/grounding-dino-base"
-    grounding_dino_text_prompt: "coke can. meat can. banana. hammer. strawberry."
+    grounding_dino_text_prompt: "red cylindrical soda can. rectangular spam-like meat can. banana. hammer with long handle. strawberry."
     grounding_dino_box_threshold: 0.25
     grounding_dino_text_threshold: 0.20
     grounding_dino_device: "auto"
     grounding_dino:
       enabled: true
       model_id: "IDEA-Research/grounding-dino-base"
-      text_prompt: "coke can. meat can. banana. hammer. strawberry."
+      text_prompt: "red cylindrical soda can. rectangular spam-like meat can. banana. hammer with long handle. strawberry."
       box_threshold: 0.25
       text_threshold: 0.20
       device: "auto"
@@ -60,13 +61,17 @@
       device: "auto"
     fail_open:
       enabled: true
-      low_risk_objects: ["meat_can", "coke_can", "strawberry"]
+      low_risk_objects: ["banana", "meat_can", "coke_can", "strawberry", "hammer"]
       allow_generic_object_fallback: true
       allow_depth_cluster_fallback: true
       min_generic_grasp_score: 0.75
       min_depth_cluster_grasp_score: 0.80
       max_attempts_per_object: 2
       move_to_observe_before_retry: true
+    calibration:
+      strict_target: true
+      reject_wrong_object: true
+      use_ground_truth_validation: true
     dataset_collection:
       bbox_mode: "pointcloud_visible_box"
       fallback_bbox_mode: "projected_3d_box"

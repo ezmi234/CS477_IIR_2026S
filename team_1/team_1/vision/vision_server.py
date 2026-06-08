@@ -182,6 +182,7 @@ class VisionServer(Node):
         self.declare_parameter("future_backend_order", ["yolo", "hf_owlvit"])
         self.declare_parameter("allow_backend_fallback", True)
         self.declare_parameter("backend_debug", True)
+        self.declare_parameter("strict_semantic_prompts", True)
         self.declare_parameter("save_debug_images", False)
         self.declare_parameter("debug_dir", "/home/ubuntu/cs477_ws/debug_runs/vision_debug")
         self.declare_parameter("warmup_on_start", True)
@@ -202,7 +203,7 @@ class VisionServer(Node):
         self.declare_parameter("grounding_dino_model_id", "IDEA-Research/grounding-dino-base")
         self.declare_parameter(
             "grounding_dino_text_prompt",
-            "coke can. meat can. banana. hammer. strawberry.",
+            "red cylindrical soda can. rectangular spam-like meat can. banana. hammer with long handle. strawberry.",
         )
         self.declare_parameter("grounding_dino_box_threshold", 0.25)
         self.declare_parameter("grounding_dino_text_threshold", 0.20)
@@ -216,7 +217,10 @@ class VisionServer(Node):
         self.declare_parameter("debug", True)
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("fail_open.enabled", True)
-        self.declare_parameter("fail_open.low_risk_objects", ["meat_can", "coke_can", "strawberry"])
+        self.declare_parameter(
+            "fail_open.low_risk_objects",
+            ["banana", "meat_can", "coke_can", "strawberry", "hammer"],
+        )
         self.declare_parameter("fail_open.allow_generic_object_fallback", True)
         self.declare_parameter("fail_open.allow_depth_cluster_fallback", True)
         self.declare_parameter("fail_open.min_generic_grasp_score", 0.75)
@@ -249,6 +253,7 @@ class VisionServer(Node):
         self.ranking_request_budget_sec = min(1.0, max(0.10, float(self.get_parameter("ranking_request_budget_sec").value)))
         self.debug = bool(self.get_parameter("debug").value)
         self.backend_debug = bool(self.get_parameter("backend_debug").value)
+        self.strict_semantic_prompts = bool(self.get_parameter("strict_semantic_prompts").value)
         self.allow_backend_fallback = bool(self.get_parameter("allow_backend_fallback").value)
         self.save_debug_images = bool(self.get_parameter("save_debug_images").value)
         self.debug_dir = str(self.get_parameter("debug_dir").value)
@@ -339,7 +344,8 @@ class VisionServer(Node):
             f"backend_order={backend_order}, yolo_enabled={params.get('yolo_enabled')}, "
             f"yolo_model_path={params.get('yolo_model_path')!r}, "
             f"yolo_conf={params.get('yolo_conf')}, yolo_device={params.get('yolo_device')!r}, "
-            f"allow_backend_fallback={self.allow_backend_fallback}, backend_debug={self.backend_debug}"
+            f"allow_backend_fallback={self.allow_backend_fallback}, backend_debug={self.backend_debug}, "
+            f"strict_semantic_prompts={self.strict_semantic_prompts}"
         )
         self.backends = []
         self.backend_order_names = []
@@ -567,6 +573,7 @@ class VisionServer(Node):
             image_crop = self.image_crop_for_detection(image, det.bbox_xyxy)
             verification = verify_candidate(target, det_dict, roi_points, image_crop)
             isolation = self.isolation_score(det, detections)
+            can_shape_policy = self.can_shape_policy(target, verification.debug)
 
             pose_msg = self.pose_stamped_for_detection(det, cam)
             tf_started = time.monotonic()
@@ -597,16 +604,30 @@ class VisionServer(Node):
                     det_dict,
                     self.grasp_config,
                 )
+                label_grasp_config = self.grasp_config.get(target, {})
                 min_candidate_score = float(
-                    self.grasp_config.get("default", {}).get("min_candidate_score", 0.25)
+                    label_grasp_config.get(
+                        "min_grasp_score",
+                        label_grasp_config.get(
+                            "min_candidate_score",
+                            self.grasp_config.get("default", {}).get("min_candidate_score", 0.25),
+                        ),
+                    )
                 )
                 if not grasp_candidates or grasp_candidates[0].score < min_candidate_score:
-                    fallback = fallback_grasp_candidates(
-                        det_dict,
-                        self.grasp_config,
-                        frame_id=getattr(getattr(cloud_msg, "header", None), "frame_id", ""),
-                        camera_name=det.camera_name,
-                    )
+                    fallback = []
+                    if (
+                        target == "hammer"
+                        and bool(label_grasp_config.get("skip_if_uncertain", True))
+                    ):
+                        grasp_candidates = []
+                    else:
+                        fallback = fallback_grasp_candidates(
+                            det_dict,
+                            self.grasp_config,
+                            frame_id=getattr(getattr(cloud_msg, "header", None), "frame_id", ""),
+                            camera_name=det.camera_name,
+                        )
                     if fallback:
                         grasp_candidates.extend(fallback)
                         grasp_candidates.sort(key=lambda c: c.score, reverse=True)
@@ -647,6 +668,7 @@ class VisionServer(Node):
                 * max(0.0, min(1.0, reachability))
                 * (0.60 + 0.40 * isolation)
                 * (0.70 + 0.30 * edge_score)
+                * float(can_shape_policy.get("shape_factor", 1.0))
                 * risk_factor
                 * camera_factor
             )
@@ -666,6 +688,8 @@ class VisionServer(Node):
                 reject_reason = reject_reason or "wrist_transform_stale"
             if reachability <= 0.05:
                 reject_reason = reject_reason or "unreachable_base_pose"
+            if can_shape_policy.get("reject_reason"):
+                reject_reason = reject_reason or str(can_shape_policy["reject_reason"])
 
             rankings.append({
                 "detection": det,
@@ -693,6 +717,11 @@ class VisionServer(Node):
                     "center_transform_mode": center_transform_mode,
                     "grasp_transform_mode": grasp_transform_mode,
                     "backend": det.backend,
+                    "query_text": det.query_text,
+                    "strict_prompt_mode": bool(self.strict_semantic_prompts),
+                    "fallback_prompt_used": getattr(det, "detection_stage", "normal_target_detection")
+                    != "normal_target_detection",
+                    "fallback_prompt_reason": getattr(det, "fallback_reason", ""),
                     "detection_stage": getattr(det, "detection_stage", "normal_target_detection"),
                     "semantic_detection_failed": getattr(det, "detection_stage", "normal_target_detection")
                     != "normal_target_detection",
@@ -713,6 +742,29 @@ class VisionServer(Node):
                     "grasp_score": grasp_score,
                     "grasp_quality_score": float(grasp_quality),
                     "verification_score": verification_score,
+                    "shape_factor": float(can_shape_policy.get("shape_factor", 1.0)),
+                    "cross_class_penalty": float(can_shape_policy.get("cross_class_penalty", 0.0)),
+                    "shape_reason": can_shape_policy.get("shape_reason", ""),
+                    "shape_decision": can_shape_policy.get(
+                        "shape_decision",
+                        verification.debug.get("shape_decision", ""),
+                    ),
+                    "candidate_label": det.label,
+                    "red_support": float(verification.debug.get("red_support", 0.0) or 0.0),
+                    "cylindrical_score": float(verification.debug.get("cylindrical_score", 0.0) or 0.0),
+                    "rectangular_score": float(verification.debug.get("rectangular_score", 0.0) or 0.0),
+                    "red_cylindrical_score": float(verification.debug.get("red_cylindrical_score", 0.0) or 0.0),
+                    "coke_can_score": float(verification.debug.get("coke_can_score", 0.0) or 0.0),
+                    "meat_can_score": float(verification.debug.get("meat_can_score", 0.0) or 0.0),
+                    "elongation_score": float(verification.debug.get("elongation_score", 0.0) or 0.0),
+                    "handle_score": float(verification.debug.get("handle_score", 0.0) or 0.0),
+                    "head_asymmetry_score": float(verification.debug.get("head_asymmetry_score", 0.0) or 0.0),
+                    "hammer_score": float(verification.debug.get("hammer_score", 0.0) or 0.0),
+                    "compact_object_penalty": float(verification.debug.get("compact_object_penalty", 0.0) or 0.0),
+                    "can_like_penalty": float(verification.debug.get("can_like_penalty", 0.0) or 0.0),
+                    "banana_like_penalty": float(verification.debug.get("banana_like_penalty", 0.0) or 0.0),
+                    "handle_region_found": bool(verification.debug.get("handle_region_found", False)),
+                    "head_region_found": bool(verification.debug.get("head_region_found", False)),
                     "bbox_area": int(bbox_area),
                     "point_count": int(point_dims["point_count"]),
                     "dimensions": [
@@ -875,6 +927,7 @@ class VisionServer(Node):
             "target": target,
             "selected_index": selected_index,
             "candidates": candidates,
+            "strict_prompt_mode": bool(self.strict_semantic_prompts),
             "backend_order": list(getattr(self, "backend_order_names", [])),
             "allow_backend_fallback": bool(getattr(self, "allow_backend_fallback", True)),
             "backend_debug": bool(getattr(self, "backend_debug", False)),
@@ -1128,6 +1181,83 @@ class VisionServer(Node):
             return 0.88
         return 0.72
 
+    @staticmethod
+    def can_shape_policy(target: str, debug: dict[str, Any]) -> dict[str, Any]:
+        if target == "hammer":
+            hammer_score = float(debug.get("hammer_score", 0.0) or 0.0)
+            elongation = float(debug.get("elongation_score", 0.0) or 0.0)
+            handle = float(debug.get("handle_score", 0.0) or 0.0)
+            compact_penalty = float(debug.get("compact_object_penalty", 0.0) or 0.0)
+            can_penalty = float(debug.get("can_like_penalty", 0.0) or 0.0)
+            banana_penalty = float(debug.get("banana_like_penalty", 0.0) or 0.0)
+            reject_reason = debug.get("reject_reason")
+            penalty = min(0.90, 0.45 * compact_penalty + 0.35 * can_penalty + 0.35 * banana_penalty)
+            preference = 0.70 + 0.35 * hammer_score + 0.15 * elongation + 0.15 * handle
+            reason = debug.get("shape_decision", "long_handle_with_head")
+            if hammer_score < 0.48 or handle < 0.35:
+                reject_reason = reject_reason or "hammer rejected: weak handle/shape confidence"
+                reason = "weak_handle_evidence"
+            return {
+                "shape_factor": max(0.03, min(1.22, preference * (1.0 - penalty))),
+                "cross_class_penalty": float(penalty),
+                "shape_reason": reason,
+                "shape_decision": reason,
+                "reject_reason": reject_reason,
+            }
+
+        if target not in {"meat_can", "coke_can"}:
+            return {
+                "shape_factor": 1.0,
+                "cross_class_penalty": 0.0,
+                "shape_reason": "",
+                "shape_decision": debug.get("shape_decision", ""),
+                "reject_reason": None,
+            }
+
+        coke_score = float(debug.get("coke_can_score", 0.0) or 0.0)
+        meat_score = float(debug.get("meat_can_score", 0.0) or 0.0)
+        rectangular = float(debug.get("rectangular_score", 0.0) or 0.0)
+        red_cylindrical = float(debug.get("red_cylindrical_score", 0.0) or 0.0)
+        red = float(debug.get("red_support", 0.0) or 0.0)
+        cylindrical = float(debug.get("cylindrical_score", 0.0) or 0.0)
+        reject_reason = debug.get("reject_reason")
+
+        if target == "meat_can":
+            cross = max(0.0, coke_score - meat_score)
+            red_cylinder_penalty = max(0.0, red_cylindrical - 0.45)
+            penalty = min(0.85, 0.75 * cross + 0.60 * red_cylinder_penalty)
+            preference = 0.88 + 0.20 * rectangular + 0.08 * max(0.0, meat_score - coke_score)
+            reason = "rectangular_spam_can" if meat_score >= coke_score else "ambiguous_can"
+            if coke_score > meat_score + 0.12 and red_cylindrical >= 0.55:
+                reason = "candidate appears more like red cylindrical coke_can"
+                if red_cylindrical >= 0.78:
+                    reject_reason = reject_reason or reason
+            return {
+                "shape_factor": max(0.05, min(1.18, preference * (1.0 - penalty))),
+                "cross_class_penalty": float(penalty),
+                "shape_reason": reason,
+                "shape_decision": debug.get("shape_decision", reason),
+                "reject_reason": reject_reason,
+            }
+
+        cross = max(0.0, meat_score - coke_score)
+        rectangular_penalty = max(0.0, rectangular - 0.50) if red < 0.12 else max(0.0, rectangular - 0.75)
+        weak_red_penalty = max(0.0, 0.12 - red) if cylindrical < 0.60 else 0.0
+        penalty = min(0.85, 0.75 * cross + 0.50 * rectangular_penalty + 1.50 * weak_red_penalty)
+        preference = 0.88 + 0.18 * red_cylindrical + 0.08 * max(0.0, coke_score - meat_score)
+        reason = "red_cylindrical_can" if coke_score >= meat_score else "ambiguous_can"
+        if meat_score > coke_score + 0.12 and rectangular >= 0.62 and red < 0.18:
+            reason = "candidate appears more like rectangular meat_can"
+            if rectangular >= 0.78:
+                reject_reason = reject_reason or reason
+        return {
+            "shape_factor": max(0.05, min(1.16, preference * (1.0 - penalty))),
+            "cross_class_penalty": float(penalty),
+            "shape_reason": reason,
+            "shape_decision": debug.get("shape_decision", reason),
+            "reject_reason": reject_reason,
+        }
+
     def backend_trace_entry(
         self,
         target: str,
@@ -1230,7 +1360,7 @@ class VisionServer(Node):
             return False
         if target not in self.fail_open_low_risk_objects:
             return False
-        return OBJECT_RISK.get(target, "medium") == "low"
+        return target in {"banana", "meat_can", "coke_can", "strawberry", "hammer"}
 
     def selected_record_passes_return_gate(
         self,
@@ -1285,6 +1415,7 @@ class VisionServer(Node):
                         query_target,
                         cam.name,
                         query_stage=stage,
+                        strict_semantic_prompts=self.strict_semantic_prompts,
                     )
                 except TypeError:
                     detections = backend.detect(cam.image_bgr, cam.cloud_msg, query_target, cam.name)
@@ -1403,7 +1534,7 @@ class VisionServer(Node):
                 backend_decision["fail_open_used"] = selected_stage != "normal_target_detection"
                 if selected_stage != "normal_target_detection":
                     self.get_logger().warn(
-                        f"attempting_uncertain_low_risk_pick: target={target}, "
+                        f"attempting_uncertain_pick: target={target}, "
                         f"detection_stage={selected_stage}, final_score={float(metadata.get('final_score', 0.0)):.3f}, "
                         f"grasp_score={float(metadata.get('grasp_score', 0.0)):.3f}, "
                         f"camera={metadata.get('camera_name', 'unknown')}"
@@ -1418,6 +1549,7 @@ class VisionServer(Node):
     def detect_callback(self, request, response):
         request_started = time.monotonic()
         prompt = getattr(request, "data", "")
+        attempt_required_by_policy = "attempt_required_by_policy" in str(prompt).lower()
         target = extract_target_label(prompt, default="object")
         target = normalize_label(target)
         aliases = canonical_aliases_for_log(target)
@@ -1452,6 +1584,7 @@ class VisionServer(Node):
                     target,
                     cam.name,
                     query_stage="normal_target_detection",
+                    strict_semantic_prompts=self.strict_semantic_prompts,
                 )
                 elapsed = time.monotonic() - backend_started
                 backend_detection_time += elapsed
@@ -1534,6 +1667,7 @@ class VisionServer(Node):
             rankings,
             backend_trace,
         )
+        backend_decision["attempt_required_by_policy"] = bool(attempt_required_by_policy)
         rankings, selected_record, backend_decision, detection_extra, ranking_extra = self.try_fail_open_stages(
             target=target,
             cameras=cameras,
@@ -1625,6 +1759,7 @@ class VisionServer(Node):
             or backend_decision.get("fallback_reason")
         )
         selected_metadata["target"] = target
+        selected_metadata["attempt_required_by_policy"] = bool(attempt_required_by_policy)
         selected_metadata["backend_decision"] = backend_decision
 
         p = Pose()
@@ -1666,16 +1801,30 @@ class VisionServer(Node):
                 selected.to_dict(),
                 self.grasp_config,
             )
+            selected_grasp_config = self.grasp_config.get(target, {})
             min_candidate_score = float(
-                self.grasp_config.get("default", {}).get("min_candidate_score", 0.25)
+                selected_grasp_config.get(
+                    "min_grasp_score",
+                    selected_grasp_config.get(
+                        "min_candidate_score",
+                        self.grasp_config.get("default", {}).get("min_candidate_score", 0.25),
+                    ),
+                )
             )
             if not grasp_candidates or grasp_candidates[0].score < min_candidate_score:
-                template_candidates = fallback_grasp_candidates(
-                    selected.to_dict(),
-                    self.grasp_config,
-                    frame_id=selected_cam.cloud_msg.header.frame_id,
-                    camera_name=selected_cam.name,
-                )
+                template_candidates = []
+                if (
+                    target == "hammer"
+                    and bool(selected_grasp_config.get("skip_if_uncertain", True))
+                ):
+                    grasp_candidates = []
+                else:
+                    template_candidates = fallback_grasp_candidates(
+                        selected.to_dict(),
+                        self.grasp_config,
+                        frame_id=selected_cam.cloud_msg.header.frame_id,
+                        camera_name=selected_cam.name,
+                    )
                 if template_candidates:
                     best_score = grasp_candidates[0].score if grasp_candidates else 0.0
                     self.get_logger().warn(

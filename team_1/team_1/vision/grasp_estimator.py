@@ -61,12 +61,19 @@ DEFAULT_GRASP_CONFIG = {
         "approach_height": 0.16,
     },
     "hammer": {
-        "strategy": "handle_grasp",
-        "candidate_offsets_along_axis": [-0.08, -0.05, -0.025, 0.0, 0.025, 0.05, 0.08],
-        "candidate_yaw_offsets": [0.0, 1.5708],
+        "strategy": "hammer_handle_grasp",
+        "candidate_offsets_along_axis": [0.0],
+        "candidate_yaw_offsets": [0.0],
         "max_handle_width": 0.065,
+        "min_length_width_ratio": 1.85,
+        "min_handle_score": 0.48,
+        "require_handle_region": True,
+        "skip_if_uncertain": True,
+        "min_candidate_score": 0.25,
+        "min_grasp_score": 0.80,
         "surface_depth_offset": 0.0,
-        "approach_height": 0.17,
+        "approach_height": 0.14,
+        "lift_height": 0.12,
         # For hammer, largest connected component may keep only the head or only
         # the handle depending on the detector crop; keep the full filtered ROI.
         "use_largest_cluster": False,
@@ -260,6 +267,10 @@ def estimate_grasp_candidates(image_bgr, cloud_msg, detection: dict[str, Any], c
             })
     elif strategy == "elongated_pca":
         specs = _elongated_pca_specs(pts, geometry, settings)
+    elif strategy == "hammer_handle_grasp":
+        specs = _hammer_handle_grasp_specs(pts, geometry, settings)
+        if not specs and bool(settings.get("skip_if_uncertain", True)):
+            return []
     elif strategy == "handle_grasp":
         specs = _handle_grasp_specs(pts, geometry, settings)
     elif strategy == "can_side_or_top_center":
@@ -268,6 +279,8 @@ def estimate_grasp_candidates(image_bgr, cloud_msg, detection: dict[str, Any], c
         specs = _compact_top_center_specs(image_bgr, bbox, pts, geometry, settings)
     else:
         specs = _center_top_specs(pts, geometry, settings)
+    if not specs and _label_key(label) == "hammer" and bool(settings.get("skip_if_uncertain", True)):
+        return []
     if not specs:
         specs = _center_top_specs(pts, geometry, settings)
 
@@ -335,6 +348,8 @@ def fallback_grasp_candidates(detection: dict[str, Any], config: dict[str, Any] 
         offsets = [np.array([0.0, 0.0, 0.0], dtype=float)]
         width = 0.055
     elif label_key == "hammer":
+        if bool(settings.get("skip_if_uncertain", True)) or bool(settings.get("require_handle_region", True)):
+            return []
         yaws = [0.0, math.pi / 2.0]
         offsets = [np.array([-0.04, 0.0, 0.0], dtype=float), np.array([0.04, 0.0, 0.0], dtype=float), np.zeros(3)]
         width = 0.045
@@ -1190,6 +1205,160 @@ def _handle_grasp_specs(pts: np.ndarray, geometry: dict[str, Any], settings: dic
     return _elongated_pca_specs(pts, geometry, settings)
 
 
+def _hammer_handle_grasp_specs(pts: np.ndarray, geometry: dict[str, Any], settings: dict[str, Any]) -> list[dict[str, Any]]:
+    pts = _finite_points(pts)
+    if pts.shape[0] < max(16, int(settings.get("min_points", 45) * 0.45)):
+        return []
+
+    center_xy = geometry["center_xy"]
+    major = geometry["major"]
+    minor = geometry["minor"]
+    along = (pts[:, :2] - center_xy) @ major
+    across = (pts[:, :2] - center_xy) @ minor
+    pca_yaw = float(geometry["pca_yaw"])
+    length = max(float(geometry["length"]), 1e-6)
+    width = max(float(geometry["width"]), 1e-6)
+    length_width_ratio = length / width
+    if length_width_ratio < float(settings.get("min_length_width_ratio", 1.85)):
+        return []
+
+    lo, hi = np.nanpercentile(along, [5.0, 95.0])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return []
+    bin_count = max(10, int(settings.get("axis_bin_count", 16)))
+    edges = np.linspace(lo, hi, bin_count + 1)
+    min_bin_points = max(5, int(round(len(pts) * 0.020)))
+    bands: list[dict[str, Any]] = []
+    for index in range(bin_count):
+        mask = (along >= edges[index]) & (along < edges[index + 1])
+        count = int(np.count_nonzero(mask))
+        if count < min_bin_points:
+            continue
+        local_across = across[mask]
+        local_z = pts[mask, 2]
+        local_width = _robust_span(local_across)
+        z_spread = _robust_span(local_z)
+        center_s = float((edges[index] + edges[index + 1]) * 0.5)
+        bands.append({
+            "mask": mask,
+            "index": int(index),
+            "count": int(count),
+            "width": float(local_width),
+            "z_spread": float(z_spread),
+            "center_s": center_s,
+        })
+    if len(bands) < 3:
+        return []
+
+    max_handle_width = float(settings.get("max_handle_width", 0.065))
+    widths = [float(band["width"]) for band in bands]
+    narrow_width = min(widths)
+    wide_width = max(widths)
+    head_band = max(bands, key=lambda band: (float(band["width"]), float(band["count"])))
+    head_s = float(head_band["center_s"])
+    head_region_found = bool(wide_width >= max(max_handle_width * 1.18, narrow_width * 1.35))
+
+    handle_bands = []
+    for band in bands:
+        band_width = float(band["width"])
+        distance_from_head = abs(float(band["center_s"]) - head_s)
+        narrow_score = _clamp((max_handle_width * 1.35 - band_width) / max(max_handle_width * 0.90, 1e-6))
+        count_score = _clamp(float(band["count"]) / max(18.0, float(len(pts)) * 0.06))
+        head_avoidance = _clamp(distance_from_head / max(0.050, length * 0.30))
+        middle_score = _clamp(1.0 - abs(float(band["center_s"]) - float(np.nanmedian(along))) / max(length * 0.55, 1e-6))
+        z_score = _clamp(1.0 - float(band["z_spread"]) / 0.055)
+        handle_score = 0.38 * narrow_score + 0.22 * count_score + 0.20 * head_avoidance + 0.12 * middle_score + 0.08 * z_score
+        if band_width <= max_handle_width * 1.45:
+            candidate = dict(band)
+            candidate.update({
+                "narrow_score": float(narrow_score),
+                "count_score": float(count_score),
+                "head_avoidance_score": float(head_avoidance),
+                "middle_score": float(middle_score),
+                "z_score": float(z_score),
+                "handle_score": float(handle_score),
+                "head_avoidance_distance": float(distance_from_head),
+                "kind": "handle",
+            })
+            handle_bands.append(candidate)
+
+    min_handle_score = float(settings.get("min_handle_score", 0.48))
+    handle_bands = [band for band in handle_bands if float(band["handle_score"]) >= min_handle_score]
+    if not handle_bands:
+        return []
+    handle_bands.sort(key=lambda band: float(band["handle_score"]), reverse=True)
+    best_bands = handle_bands[: min(3, len(handle_bands))]
+
+    yaw_values = _yaw_values(pca_yaw, settings, default=[0.0])
+    specs: list[dict[str, Any]] = []
+    for rank, band in enumerate(best_bands):
+        mask = band["mask"]
+        local_pts = pts[mask]
+        target = np.nanmedian(local_pts, axis=0)
+        surface_z = float(np.nanpercentile(local_pts[:, 2], 10.0))
+        target[2] = surface_z + float(settings.get("surface_depth_offset", 0.0))
+        axis_fraction = float(band["center_s"] / max(length * 0.5, 1e-6))
+        head_avoidance_distance = float(band["head_avoidance_distance"])
+        head_asymmetry = _clamp((wide_width - narrow_width) / max(wide_width, 0.040))
+        base_bonus = 0.28 + 0.18 * float(band["handle_score"]) + 0.08 * head_asymmetry
+        if head_region_found:
+            base_bonus += 0.06
+        for yaw in yaw_values:
+            width_for_yaw = _estimated_width_for_yaw(
+                pts,
+                target[:2],
+                yaw,
+                local_radius=max(0.030, min(0.075, length * 0.18)),
+            )
+            if width_for_yaw <= 1e-6:
+                width_for_yaw = min(max_handle_width, float(band["width"]))
+            specs.append({
+                "method": "hammer_handle_grasp",
+                "point": target.copy(),
+                "yaw": yaw,
+                "estimated_width": width_for_yaw,
+                "bonus": base_bonus if rank == 0 else max(0.18, base_bonus - 0.05 * rank),
+                "debug": {
+                    "strategy": "hammer_handle_grasp",
+                    "method": "hammer_handle_grasp",
+                    "local_affordance_method": "hammer_handle_axis_band",
+                    "principal_axis_yaw": float(pca_yaw),
+                    "handle_region_found": True,
+                    "head_region_found": bool(head_region_found),
+                    "grasp_on_handle": True,
+                    "head_avoidance_distance": head_avoidance_distance,
+                    "head_handle_separation_estimate": float(max(0.0, wide_width - float(band["width"]))),
+                    "selected_reason": "middle of long handle, away from head",
+                    "selected_handle_segment": {
+                        k: float(v) if isinstance(v, (int, float, np.floating)) else v
+                        for k, v in band.items()
+                        if k != "mask"
+                    },
+                    "head_segment": {
+                        k: float(v) if isinstance(v, (int, float, np.floating)) else v
+                        for k, v in head_band.items()
+                        if k != "mask"
+                    },
+                    "axis_offset_m": float(band["center_s"]),
+                    "axis_fraction": axis_fraction,
+                    "local_width": float(band["width"]),
+                    "handle_score": float(band["handle_score"]),
+                    "head_asymmetry_score": float(head_asymmetry),
+                    "length_to_width_ratio": float(length_width_ratio),
+                    "yaw_candidates": [float(value) for value in yaw_values],
+                    "selected_yaw": float(yaw),
+                    "skip_reason": None,
+                },
+                "score_terms": {
+                    "handle_score": float(band["handle_score"]),
+                    "head_asymmetry": float(head_asymmetry),
+                    "length_width_ratio": float(_clamp((length_width_ratio - 1.5) / 3.0)),
+                    "head_avoidance": float(band["head_avoidance_score"]),
+                },
+            })
+    return specs
+
+
 def _local_axis_band_specs(pts: np.ndarray, geometry: dict[str, Any], settings: dict[str, Any], *, label_kind: str) -> list[dict[str, Any]]:
     pts = _finite_points(pts)
     if pts.shape[0] < 12:
@@ -1403,6 +1572,16 @@ def _robust_span(values: np.ndarray) -> float:
         return 0.0
     lo, hi = np.nanpercentile(values, [5.0, 95.0])
     return max(0.0, float(hi - lo))
+
+
+def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return lo
+    if not np.isfinite(value):
+        return lo
+    return float(max(lo, min(hi, value)))
 
 
 def _nearest_uv_for_point(roi: np.ndarray, mask: np.ndarray, point: np.ndarray, x_offset: int, y_offset: int) -> list[int] | None:

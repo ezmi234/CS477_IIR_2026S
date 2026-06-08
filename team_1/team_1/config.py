@@ -169,17 +169,23 @@ OBJECT_PICK_OVERRIDES = {
         'use_vision_grasp_orientation': True,
     },
     'hammer': {
-        'approach_height': 0.18,
-        'lift_height': 0.34,
-        'grasp_z_offset': -0.010,
-        'vision_grasp_z_offset': 0.0,
+        'approach_height': 0.14,
+        'lift_height': 0.12,
+        'grasp_z_offset': -0.006,
+        'vision_grasp_z_offset': -0.006,
         'vision_grasp_z_min': -0.045,
         'vision_grasp_z_max': 0.040,
         'close_timeout': 3.0,
+        'velocity_scale': 0.45,
+        'acceleration_scale': 0.45,
         'approach_duration': 3.2,
         'descent_duration': 2.8,
         'lift_duration': 3.2,
         'post_close_sleep': 0.35,
+        'min_candidate_score': 0.25,
+        'min_grasp_score': 0.80,
+        'require_handle_region': True,
+        'skip_if_uncertain': True,
         'use_vision_grasp_orientation': True,
     },
 }
@@ -243,32 +249,69 @@ OBJECT_GRASP_PROFILES = {
         'lift_duration': 2.2,
     },
     'hammer': {
-        'strategy': 'handle_grasp',
+        'strategy': 'hammer_handle_grasp',
         'close_pos': 0.75,
         'close_timeout': 3.0,
-        'approach_height': 0.16,
-        'grasp_z_offset': -0.012,
-        'vision_grasp_z_offset': 0.0,
+        'approach_height': 0.14,
+        'grasp_z_offset': -0.006,
+        'vision_grasp_z_offset': -0.006,
         'vision_grasp_z_min': -0.045,
         'vision_grasp_z_max': 0.040,
-        'lift_height': 0.22,
+        'lift_height': 0.12,
         'yaw_mode': 'handle_axis',
         'risk': 'high',
+        'velocity_scale': 0.45,
+        'acceleration_scale': 0.45,
         'approach_duration': 3.2,
         'descent_duration': 2.8,
         'lift_duration': 3.2,
         'post_close_sleep': 0.35,
+        'min_candidate_score': 0.25,
+        'min_grasp_score': 0.80,
+        'require_handle_region': True,
+        'skip_if_uncertain': True,
         'use_vision_grasp_orientation': True,
     },
 }
 
 UNCERTAIN_PICK_PROFILE = {
-    'velocity_scale': 0.45,
-    'acceleration_scale': 0.45,
-    'approach_height': 0.14,
-    'lift_height': 0.10,
+    'velocity_scale': 0.40,
+    'acceleration_scale': 0.40,
+    'approach_height': 0.16,
+    'lift_height': 0.08,
+    'descent_duration': 2.5,
+    'lift_duration': 2.5,
     'close_force': 0.8,
     'require_lift_verification': True,
+    'abort_if_no_object_lifted': True,
+}
+
+COMPETITION_POLICY = {
+    'ensure_attempt_for_each_requested_object': True,
+    'min_attempts_per_requested_object': 1,
+    'max_attempts_per_object': 2,
+    'requeue_failed_low_risk_objects': True,
+    'attempt_hammer_last': True,
+    'allow_uncertain_attempt_if_no_better_candidate': True,
+    'min_time_remaining_for_safe_attempt_sec': 45.0,
+    'stop_if_robot_stuck_sec': 80.0,
+}
+
+OBJECT_PRIORITY_CONFIG = {
+    'easy_first': ['banana', 'meat_can', 'coke_can', 'strawberry'],
+    'risky_last': ['hammer'],
+}
+
+HAMMER_POLICY = {
+    'attempt_if_requested': True,
+    'attempt_order': 'last',
+    'max_attempts': 1,
+    'require_reachable_candidate': True,
+    'allow_generic_long_object_fallback': True,
+    'allow_depth_cluster_fallback': True,
+    'skip_if_time_remaining_below_sec': 45.0,
+    'velocity_scale': 0.35,
+    'grasp_strategy': 'hammer_handle_grasp',
 }
 
 STORAGE_OBJECT_OVERRIDES = {
@@ -297,7 +340,12 @@ OBJECT_ALIASES = {
         'soda can', 'drink can', 'beverage can', 'coke', 'cola',
     ],
     'strawberry': ['strawberry'],
-    'hammer': ['hammer'],
+    'hammer': [
+        'hammer with long handle', 'hammer with wooden handle',
+        'tool with long stick handle', 'long handled hammer',
+        'hammer head and stick handle', 'metal hammer with handle',
+        'hammer tool', 'long handle', 'stick handle', 'tool handle', 'hammer',
+    ],
     'book': ['book'],
     'eraser': ['eraser'],
     'soap': ['soap'],
@@ -340,7 +388,7 @@ MIN_GRASP_SCORE = {
     'coke_can': 0.12,
     'strawberry': 0.10,
     'banana': 0.18,
-    'hammer': 0.35,
+    'hammer': 0.80,
 }
 
 MIN_FINAL_CANDIDATE_SCORE = {
@@ -405,6 +453,15 @@ def _apply_target_config():
 
 def _apply_motion_config():
     motion = _load_package_yaml('motion.yaml')
+    competition = motion.get('competition_policy', {})
+    if isinstance(competition, dict):
+        _deep_update(COMPETITION_POLICY, competition)
+    object_priority = motion.get('object_priority', {})
+    if isinstance(object_priority, dict):
+        _deep_update(OBJECT_PRIORITY_CONFIG, object_priority)
+    hammer_policy = motion.get('hammer_policy', {})
+    if isinstance(hammer_policy, dict):
+        _deep_update(HAMMER_POLICY, hammer_policy)
     uncertain = motion.get('uncertain_pick_profile', {})
     if isinstance(uncertain, dict):
         _deep_update(UNCERTAIN_PICK_PROFILE, uncertain)
@@ -484,6 +541,8 @@ def _apply_grasp_profile_config():
             'lift_duration',
             'post_close_sleep',
             'close_force',
+            'require_lift_verification',
+            'abort_if_no_object_lifted',
             'use_vision_grasp_orientation',
             'velocity_scale',
             'acceleration_scale',

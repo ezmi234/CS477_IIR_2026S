@@ -1,6 +1,13 @@
 from dataclasses import replace
 
-from .config import OBJECT_RISK, OBJECT_SUCCESS_PRIORITY, TASK_EXECUTION_PRIORITY
+from .config import (
+    COMPETITION_POLICY,
+    HAMMER_POLICY,
+    OBJECT_PRIORITY_CONFIG,
+    OBJECT_RISK,
+    OBJECT_SUCCESS_PRIORITY,
+    TASK_EXECUTION_PRIORITY,
+)
 
 
 RISK_ORDER = {
@@ -39,13 +46,22 @@ class TaskPlanner:
 
     @classmethod
     def from_node(cls, node):
+        configured_max_attempts = int(COMPETITION_POLICY.get('max_attempts_per_object', 2) or 2)
+        retry_budget = max(
+            int(node.get_parameter('max_task_retries').value),
+            max(0, configured_max_attempts - 1),
+        )
         return cls(
             mode=node.get_parameter('task_planner').value,
-            max_task_retries=node.get_parameter('max_task_retries').value,
+            max_task_retries=retry_budget,
         )
 
     def describe(self):
-        return f'{self.mode}, max_task_retries={self.max_task_retries}'
+        ensure = bool(COMPETITION_POLICY.get('ensure_attempt_for_each_requested_object', True))
+        return (
+            f'{self.mode}, max_task_retries={self.max_task_retries}, '
+            f'ensure_requested_attempt={ensure}'
+        )
 
     def order_initial_tasks(self, tasks, snapshot=None):
         tasks = list(tasks)
@@ -76,7 +92,10 @@ class TaskPlanner:
         reachability = float(getattr(obj, 'reachability_score', 0.5) or 0.5) if obj is not None else 0.5
         isolation = float(getattr(obj, 'isolation_score', 0.5) or 0.5) if obj is not None else 0.5
         risk = OBJECT_RISK.get(task.object_name, 'medium')
+        phase, configured_priority = self.configured_object_priority(task.object_name)
         return (
+            phase,
+            configured_priority,
             RISK_ORDER.get(risk, 1),
             OBJECT_SUCCESS_PRIORITY.get(task.object_name, TASK_EXECUTION_PRIORITY.get(task.object_name, 100)),
             blocked_penalty,
@@ -95,7 +114,7 @@ class TaskPlanner:
             if snapshot is not None:
                 obj = (getattr(snapshot, 'objects', {}) or {}).get(task.object_name)
             risk = OBJECT_RISK.get(task.object_name, 'medium')
-            priority = OBJECT_SUCCESS_PRIORITY.get(task.object_name, 100)
+            _phase, priority = self.configured_object_priority(task.object_name)
             visible = bool(obj is not None and obj.visible)
             confidence = float(getattr(obj, 'score', 0.0) or 0.0) if obj is not None else 0.0
             reachability = float(getattr(obj, 'reachability_score', 0.0) or 0.0) if obj is not None else 0.0
@@ -125,7 +144,8 @@ class TaskPlanner:
     def should_defer_pose_failure(self, task, remaining_task_count):
         if self.mode == self.COMMAND_ORDER:
             return False
-        if remaining_task_count <= 0:
+        ensure_requested = bool(COMPETITION_POLICY.get('ensure_attempt_for_each_requested_object', True))
+        if remaining_task_count <= 0 and not ensure_requested:
             return False
         if task.object_name == 'hammer':
             return False
@@ -137,10 +157,34 @@ class TaskPlanner:
         if self.mode == self.COMMAND_ORDER:
             return False
         if task.object_name == 'hammer':
-            return False
+            max_attempts = int(HAMMER_POLICY.get('max_attempts', 1) or 1)
+            return int(task.attempt) < max(0, max_attempts - 1)
         if task.object_name == 'banana':
             return int(task.attempt) < min(self.max_task_retries, 1)
         return int(task.attempt) < self.max_task_retries
 
     def defer_failed_task(self, task):
         return replace(task, attempt=int(task.attempt) + 1)
+
+    @staticmethod
+    def configured_object_priority(object_name):
+        object_name = str(object_name or '').strip().lower().replace(' ', '_')
+        easy_first = [
+            str(value).strip().lower().replace(' ', '_')
+            for value in OBJECT_PRIORITY_CONFIG.get('easy_first', [])
+        ]
+        risky_last = [
+            str(value).strip().lower().replace(' ', '_')
+            for value in OBJECT_PRIORITY_CONFIG.get('risky_last', [])
+        ]
+        if (
+            bool(COMPETITION_POLICY.get('attempt_hammer_last', True))
+            and object_name == 'hammer'
+            and object_name not in risky_last
+        ):
+            risky_last.append(object_name)
+        if object_name in easy_first:
+            return 0, easy_first.index(object_name)
+        if object_name in risky_last:
+            return 2, risky_last.index(object_name)
+        return 1, TASK_EXECUTION_PRIORITY.get(object_name, 100)

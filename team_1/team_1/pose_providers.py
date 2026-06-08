@@ -279,6 +279,11 @@ class VisionPoseProvider(PoseProvider):
         for attempt in range(1, max_attempts + 1):
             request = StringPose.Request()
             request.data = f'Detect a {prompt_name} and return pose'
+            try:
+                if bool(self.node.is_minimum_attempt_required_for_object(object_name)):
+                    request.data += ' attempt_required_by_policy'
+            except Exception:
+                pass
             self.latest_pose_stamped = None
             self.latest_grasp_base = None
             self.latest_detection_json = ''

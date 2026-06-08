@@ -20,16 +20,44 @@ motion_profile:
       velocity_scale: 0.55
       acceleration_scale: 0.55
     hammer:
-      velocity_scale: 0.50
-      acceleration_scale: 0.50
+      velocity_scale: 0.35
+      acceleration_scale: 0.35
+
+competition_policy:
+  ensure_attempt_for_each_requested_object: true
+  min_attempts_per_requested_object: 1
+  max_attempts_per_object: 2
+  requeue_failed_low_risk_objects: true
+  attempt_hammer_last: true
+  allow_uncertain_attempt_if_no_better_candidate: true
+  min_time_remaining_for_safe_attempt_sec: 45
+  stop_if_robot_stuck_sec: 80
+
+object_priority:
+  easy_first: ["banana", "meat_can", "coke_can", "strawberry"]
+  risky_last: ["hammer"]
+
+hammer_policy:
+  attempt_if_requested: true
+  attempt_order: "last"
+  max_attempts: 1
+  require_reachable_candidate: true
+  allow_generic_long_object_fallback: true
+  allow_depth_cluster_fallback: true
+  skip_if_time_remaining_below_sec: 45
+  velocity_scale: 0.35
+  grasp_strategy: "hammer_handle_grasp"
 
 uncertain_pick_profile:
-  velocity_scale: 0.45
-  acceleration_scale: 0.45
-  approach_height: 0.14
-  lift_height: 0.10
+  velocity_scale: 0.40
+  acceleration_scale: 0.40
+  approach_height: 0.16
+  lift_height: 0.08
+  descent_duration: 2.5
+  lift_duration: 2.5
   close_force: 0.8
   require_lift_verification: true
+  abort_if_no_object_lifted: true
 
 startup:
   move_to_observe_before_first_task: true
@@ -73,13 +101,18 @@ object_pick:
     use_vision_grasp_orientation: true
   hammer:
     approach_height: 0.16
-    lift_height: 0.22
-    grasp_z_offset: -0.012
+    lift_height: 0.08
+    grasp_z_offset: -0.006
+    vision_grasp_z_offset: -0.006
     approach_duration: 3.2
-    descent_duration: 2.8
-    lift_duration: 3.2
+    descent_duration: 2.5
+    lift_duration: 2.5
     close_timeout: 3.0
     post_close_sleep: 0.35
+    velocity_scale: 0.35
+    acceleration_scale: 0.35
+    require_lift_verification: true
+    abort_if_no_object_lifted: true
     use_vision_grasp_orientation: true
 
 gripper:

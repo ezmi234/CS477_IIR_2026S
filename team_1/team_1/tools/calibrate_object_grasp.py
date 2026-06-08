@@ -33,6 +33,7 @@ from .debug_eval_common import (
     pose_to_dict,
     xy_distance,
 )
+from ..vision.labels import normalize_label
 
 
 DEFAULT_OUT_ROOT = Path("/home/ubuntu/cs477_ws/debug_runs/grasp_calibration")
@@ -259,9 +260,13 @@ class CalibrationRunner(Node):
             if not isinstance(candidate, dict):
                 continue
             pose, pose_source = self.candidate_pose(candidate)
+            candidate_label = normalize_label(str(candidate.get("label", "") or ""))
+            label_matches_requested = candidate_label == object_name
             record = {
                 "index": index,
                 "label": candidate.get("label"),
+                "selected_label": candidate_label,
+                "label_matches_requested": label_matches_requested,
                 "camera": candidate.get("camera_name", candidate.get("camera")),
                 "final_score": candidate.get("final_score"),
                 "grasp_score": candidate.get("grasp_score"),
@@ -283,9 +288,12 @@ class CalibrationRunner(Node):
                 "nearest_object": nearest_label,
                 "nearest_xy_distance_m": nearest_xy,
                 "nearest_distance_m": nearest_xyz,
-                "accepted_by_strict_target": nearest_label == object_name,
+                "accepted_by_strict_target": label_matches_requested and nearest_label == object_name,
             })
-            if nearest_label != object_name:
+            if not label_matches_requested:
+                record["reject_reason"] = "wrong_object_selected"
+                rejected.append(record)
+            elif nearest_label != object_name:
                 record["reject_reason"] = "closer_to_another_object"
                 rejected.append(record)
             evaluated.append(record)
@@ -297,9 +305,19 @@ class CalibrationRunner(Node):
             selected_index = evaluated[0]["index"]
             selected_record = evaluated[0]
         selected_ok = bool(selected_record and selected_record.get("accepted_by_strict_target", False))
+        if selected_ok:
+            reason = "selected_candidate_matches_requested_gt"
+        elif not candidates:
+            reason = "no_vision_candidates"
+        elif selected_record is None:
+            reason = "selected_candidate_missing"
+        elif not selected_record.get("label_matches_requested", False):
+            reason = "wrong_object_selected"
+        else:
+            reason = "wrong_candidate_selected"
         result = {
             "passed": selected_ok,
-            "reason": "selected_candidate_matches_requested_gt" if selected_ok else "wrong_candidate_selected",
+            "reason": reason,
             "object": object_name,
             "target_gt_pose": pose_to_dict(target_gt),
             "selected_index": selected_index,
@@ -313,13 +331,18 @@ class CalibrationRunner(Node):
             f"candidate_count={len(candidates)}, rejected={len(rejected)}, "
             f"selected_index={selected_index}, selected_ok={selected_ok}"
         )
-        if not selected_ok:
+        if reason == "wrong_candidate_selected":
             self.get_logger().warn(
                 "wrong_candidate_selected: "
                 f"object={object_name}, selected_index={selected_index}, "
                 f"nearest={None if selected_record is None else selected_record.get('nearest_object')}, "
                 f"target_xy={None if selected_record is None else selected_record.get('target_xy_distance_m')}, "
                 f"nearest_xy={None if selected_record is None else selected_record.get('nearest_xy_distance_m')}"
+            )
+        elif not selected_ok:
+            self.get_logger().warn(
+                f"strict_target_preflight_failed: object={object_name}, reason={reason}, "
+                f"candidate_count={len(candidates)}"
             )
         return result
 
@@ -358,15 +381,26 @@ class CalibrationRunner(Node):
                 )
                 return {"enabled": True, "passed": True, "attempts": attempts}
             if attempt < max(1, int(self.args.strict_target_retries)):
-                self.get_logger().warn(
-                    f"wrong_candidate_selected: retry strict target preflight "
-                    f"{attempt + 1}/{max(1, int(self.args.strict_target_retries))}"
-                )
+                reason = str(attempt_report.get("reason", "strict_target_preflight_failed"))
+                if reason == "wrong_candidate_selected":
+                    self.get_logger().warn(
+                        f"wrong_candidate_selected: retry strict target preflight "
+                        f"{attempt + 1}/{max(1, int(self.args.strict_target_retries))}"
+                    )
+                else:
+                    self.get_logger().warn(
+                        f"strict_target_preflight_failed: reason={reason}; retry "
+                        f"{attempt + 1}/{max(1, int(self.args.strict_target_retries))}"
+                    )
                 self.spin_for(0.3)
         return {
             "enabled": True,
             "passed": False,
-            "reason": "wrong_candidate_selected",
+            "reason": (
+                attempts[-1].get("reason", "strict_target_preflight_failed")
+                if attempts
+                else "strict_target_preflight_failed"
+            ),
             "attempts": attempts,
         }
 
@@ -383,12 +417,25 @@ class CalibrationRunner(Node):
                     return event
         return None
 
-    def save_attempt(self, attempt_dir: Path, metadata: dict[str, Any], event):
+    def save_attempt(
+        self,
+        attempt_dir: Path,
+        metadata: dict[str, Any],
+        event,
+        start_counts: dict[str, int] | None = None,
+    ):
         attempt_dir.mkdir(parents=True, exist_ok=True)
+        if start_counts is None:
+            events = self.events
+        else:
+            events = {
+                key: values[start_counts.get(key, 0):]
+                for key, values in self.events.items()
+            }
         report = {
             "metadata": metadata,
             "final_event": event,
-            "events": self.events,
+            "events": events,
         }
         (attempt_dir / "attempt.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return report
@@ -442,9 +489,85 @@ def timestamp() -> str:
 
 
 def success_from_report(report: dict[str, Any]) -> bool:
+    if not valid_calibration_attempt(report):
+        return False
     data = ((report.get("final_event") or {}).get("data") or {})
     result = data.get("result", {}) if isinstance(data, dict) else {}
     return bool(result.get("pick_success", False))
+
+
+def selected_candidate_from_strict_report(strict_report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(strict_report, dict):
+        return None
+    selected = strict_report.get("selected_candidate")
+    if isinstance(selected, dict):
+        return selected
+    attempts = strict_report.get("attempts", [])
+    if not isinstance(attempts, list):
+        return None
+    for attempt in reversed(attempts):
+        if not isinstance(attempt, dict):
+            continue
+        selected = attempt.get("selected_candidate")
+        if isinstance(selected, dict):
+            return selected
+    return None
+
+
+def nearest_gt_object_from_strict_report(strict_report: dict[str, Any] | None) -> str | None:
+    selected = selected_candidate_from_strict_report(strict_report)
+    if not isinstance(selected, dict):
+        return None
+    nearest = selected.get("nearest_object")
+    return str(nearest) if nearest else None
+
+
+def selected_label_from_strict_report(strict_report: dict[str, Any] | None) -> str | None:
+    selected = selected_candidate_from_strict_report(strict_report)
+    if not isinstance(selected, dict):
+        return None
+    label = selected.get("selected_label", selected.get("label"))
+    return normalize_label(str(label)) if label else None
+
+
+def wrong_object_selected_from_strict_report(strict_report: dict[str, Any] | None, object_name: str) -> bool:
+    selected_label = selected_label_from_strict_report(strict_report)
+    if selected_label and selected_label != object_name:
+        return True
+    nearest = nearest_gt_object_from_strict_report(strict_report)
+    if nearest and nearest != object_name:
+        return True
+    return False
+
+
+def _final_event_data(report: dict[str, Any]) -> dict[str, Any]:
+    data = ((report.get("final_event") or {}).get("data") or {})
+    return data if isinstance(data, dict) else {}
+
+
+def valid_calibration_attempt(report: dict[str, Any]) -> bool:
+    meta = report.get("metadata", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    data = _final_event_data(report)
+    if meta.get("valid_calibration_attempt") is False or data.get("valid_calibration_attempt") is False:
+        return False
+    strict_report = meta.get("strict_target_report") or data.get("strict_target_report")
+    if isinstance(strict_report, dict) and strict_report.get("enabled") and strict_report.get("passed") is False:
+        return False
+    return True
+
+
+def wrong_object_selected_from_report(report: dict[str, Any]) -> bool:
+    meta = report.get("metadata", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    data = _final_event_data(report)
+    if bool(meta.get("wrong_object_selected", False) or data.get("wrong_object_selected", False)):
+        return True
+    object_name = str(meta.get("object", data.get("object", ""))).strip().lower().replace(" ", "_")
+    strict_report = meta.get("strict_target_report") or data.get("strict_target_report")
+    return wrong_object_selected_from_strict_report(strict_report, object_name)
 
 
 def update_config_file(
@@ -511,11 +634,13 @@ def main():
                 attempt_dir = out_dir / f"attempt_{attempt_index:03d}"
                 node.current_attempt_dir = attempt_dir
                 node.saved_images = 0
+                attempt_started = time.time()
                 metadata = {
                     "object": object_name,
                     "target": args.target,
                     "attempt": attempt_index,
                     "repeat": repeat + 1,
+                    "started": attempt_started,
                     "close_pos": close_pos,
                     "z_offset": z_offset,
                     "yaw_mode": yaw_mode,
@@ -525,35 +650,77 @@ def main():
                     "use_gt_eval": args.use_gt_eval,
                     "strict_target": bool(args.strict_target),
                     "seed": args.seed,
+                    "requested_object": object_name,
+                    "selected_label": None,
+                    "valid_calibration_attempt": True,
+                    "wrong_object_selected": False,
+                    "nearest_gt_object": None,
                 }
-                start_count = len(node.events["grasp_calibration_debug"])
+                start_counts = {key: len(value) for key, value in node.events.items()}
+                start_count = start_counts["grasp_calibration_debug"]
                 node.publish_override(object_name, close_pos, z_offset, yaw_mode, velocity_scale, args.no_place)
                 strict_report = node.strict_target_preflight(object_name)
                 metadata["strict_target_report"] = strict_report
+                metadata["valid_calibration_attempt"] = bool(strict_report.get("passed", True))
+                metadata["selected_label"] = selected_label_from_strict_report(strict_report)
+                metadata["nearest_gt_object"] = nearest_gt_object_from_strict_report(strict_report)
+                metadata["wrong_object_selected"] = wrong_object_selected_from_strict_report(
+                    strict_report,
+                    object_name,
+                )
                 if not strict_report.get("passed", True):
+                    metadata["duration"] = time.time() - attempt_started
+                    failure_reason = (
+                        "wrong_object_selected"
+                        if metadata["wrong_object_selected"]
+                        else strict_report.get("reason", "strict_target_preflight_failed")
+                    )
                     event = {
                         "time": time.time(),
                         "data": {
                             "object": object_name,
-                            "wrong_candidate_selected": True,
+                            "valid_calibration_attempt": False,
+                            "wrong_object_selected": metadata["wrong_object_selected"],
+                            "wrong_candidate_selected": metadata["wrong_object_selected"],
+                            "requested_object": object_name,
+                            "selected_label": metadata["selected_label"],
+                            "nearest_gt_object": metadata["nearest_gt_object"],
                             "strict_target_report": strict_report,
                             "result": {
                                 "pick_success": False,
-                                "failure_reason": strict_report.get("reason", "strict_target_preflight_failed"),
+                                "failure_reason": failure_reason,
                             },
                         },
                     }
-                    report = node.save_attempt(attempt_dir, metadata, event)
+                    report = node.save_attempt(attempt_dir, metadata, event, start_counts)
                     reports.append(report)
-                    node.get_logger().warn(
-                        f"wrong_candidate_selected: object={object_name}, attempt={attempt_index}; "
-                        "not executing pick command and continuing sweep."
-                    )
+                    if metadata["wrong_object_selected"]:
+                        node.get_logger().warn(
+                            "INVALID CALIBRATION ATTEMPT: "
+                            f"requested {object_name} but selected candidate is closer to "
+                            f"{metadata['nearest_gt_object']}"
+                        )
+                    else:
+                        node.get_logger().warn(
+                            f"invalid_calibration_attempt: object={object_name}, attempt={attempt_index}, "
+                            f"reason={strict_report.get('reason', 'strict_target_preflight_failed')}; "
+                            "not executing pick command and continuing sweep."
+                        )
                     node.spin_for(0.5)
                     continue
                 node.publish_command(object_name, args.target)
                 event = node.wait_for_calibration_event(object_name, start_count, args.timeout)
-                report = node.save_attempt(attempt_dir, metadata, event)
+                metadata["duration"] = time.time() - attempt_started
+                if isinstance(event, dict):
+                    data = event.setdefault("data", {})
+                    if isinstance(data, dict):
+                        data.setdefault("valid_calibration_attempt", True)
+                        data.setdefault("wrong_object_selected", False)
+                        data.setdefault("requested_object", object_name)
+                        data.setdefault("selected_label", metadata["selected_label"])
+                        data.setdefault("nearest_gt_object", metadata["nearest_gt_object"])
+                        data.setdefault("strict_target_report", strict_report)
+                report = node.save_attempt(attempt_dir, metadata, event, start_counts)
                 reports.append(report)
                 status = "success" if success_from_report(report) else "failed_or_timeout"
                 node.get_logger().info(
@@ -565,28 +732,55 @@ def main():
         node.clear_override(object_name)
 
     rows = []
-    grouped: dict[tuple[float | None, float | None], dict[str, Any]] = {}
+    grouped: dict[tuple[float | None, float | None, str | None, float | None], dict[str, Any]] = {}
     for report in reports:
         meta = report["metadata"]
         key = (meta["close_pos"], meta["z_offset"], meta.get("yaw_mode"), meta.get("velocity_scale"))
-        entry = grouped.setdefault(key, {"attempts": 0, "success": 0})
+        entry = grouped.setdefault(
+            key,
+            {
+                "attempts": 0,
+                "valid_attempts": 0,
+                "success": 0,
+                "wrong_object_selected": 0,
+                "invalid_attempts": 0,
+            },
+        )
+        valid_attempt = valid_calibration_attempt(report)
+        wrong_object_selected = wrong_object_selected_from_report(report)
+        success = success_from_report(report)
         entry["attempts"] += 1
-        entry["success"] += int(success_from_report(report))
+        entry["wrong_object_selected"] += int(wrong_object_selected)
+        entry["invalid_attempts"] += int(not valid_attempt)
+        if valid_attempt:
+            entry["valid_attempts"] += 1
+            entry["success"] += int(success)
         rows.append({
             "attempt": meta["attempt"],
             "close_pos": meta["close_pos"],
             "z_offset": meta["z_offset"],
             "yaw_mode": meta.get("yaw_mode"),
             "velocity_scale": meta.get("velocity_scale"),
-            "success": success_from_report(report),
+            "valid_calibration_attempt": valid_attempt,
+            "wrong_object_selected": wrong_object_selected,
+            "requested_object": meta.get("requested_object", meta.get("object")),
+            "nearest_gt_object": meta.get("nearest_gt_object"),
+            "success": success,
         })
 
     best_key = None
-    if grouped:
+    valid_grouped_items = [
+        (key, value)
+        for key, value in grouped.items()
+        if int(value.get("valid_attempts", 0)) > 0
+    ]
+    if valid_grouped_items:
         best_key = sorted(
-            grouped.items(),
+            valid_grouped_items,
             key=lambda item: (
+                -float(item[1]["success"]) / float(max(1, item[1]["valid_attempts"])),
                 -item[1]["success"],
+                item[1]["wrong_object_selected"],
                 item[0][0] is None,
                 item[0][0] or 0.0,
                 item[0][1] is None,
@@ -611,11 +805,21 @@ def main():
                 "yaw_mode": key[2],
                 "velocity_scale": key[3],
                 "attempts": value["attempts"],
+                "valid_attempts": value["valid_attempts"],
+                "wrong_object_selected": value["wrong_object_selected"],
+                "invalid_attempts": value["invalid_attempts"],
                 "success": value["success"],
-                "success_rate": float(value["success"]) / float(max(1, value["attempts"])),
+                "success_rate": float(value["success"]) / float(max(1, value["valid_attempts"])),
             }
             for rank, (key, value) in enumerate(
-                sorted(grouped.items(), key=lambda item: (-item[1]["success"], -item[1]["success"] / max(1, item[1]["attempts"])))
+                sorted(
+                    valid_grouped_items,
+                    key=lambda item: (
+                        -float(item[1]["success"]) / float(max(1, item[1]["valid_attempts"])),
+                        -item[1]["success"],
+                        item[1]["wrong_object_selected"],
+                    ),
+                )
             )
         ],
         "best_close_pos": best_key[0] if best_key else None,
@@ -635,17 +839,19 @@ def main():
         summary["config_file"] = str(args.config_file)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    print("attempt close_pos z_offset yaw_mode velocity_scale success")
+    print("attempt close_pos z_offset yaw_mode velocity_scale valid wrong_object success")
     for row in rows:
         print(
             f"{row['attempt']:>7} {row['close_pos']} {row['z_offset']} "
-            f"{row['yaw_mode']} {row['velocity_scale']} {row['success']}"
+            f"{row['yaw_mode']} {row['velocity_scale']} "
+            f"{row['valid_calibration_attempt']} {row['wrong_object_selected']} {row['success']}"
         )
-    print("rank close_pos z_offset yaw_mode velocity_scale success/attempts rate")
+    print("rank close_pos z_offset yaw_mode velocity_scale success/valid wrong_object rate")
     for item in summary["ranking"]:
         print(
             f"{item['rank']:>4} {item['close_pos']} {item['z_offset']} {item['yaw_mode']} "
-            f"{item['velocity_scale']} {item['success']}/{item['attempts']} "
+            f"{item['velocity_scale']} {item['success']}/{item['valid_attempts']} "
+            f"{item['wrong_object_selected']} "
             f"{item['success_rate']:.3f}"
         )
     print(f"Saved calibration run: {out_dir}")

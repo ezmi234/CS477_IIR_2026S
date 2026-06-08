@@ -1,10 +1,9 @@
 """Object-label and prompt-grounding utilities for the vision pipeline.
 
 The competition commands use human-facing names such as "coke can" or
-"meat can", while zero-shot detectors often respond better to visual aliases
-such as "red can", "soda can", "tin can", or "canned food".  This module keeps
-that mapping in one place so the ROS service can remain stable while the
-recognition backend improves progressively.
+"meat can", while zero-shot detectors respond better to visual descriptions.
+Keep coke/meat can prompts class-specific in normal runtime: coke is a red
+cylindrical drink can, while meat is a rectangular spam-like food can.
 """
 
 from __future__ import annotations
@@ -39,18 +38,28 @@ ALIASES: dict[str, list[str]] = {
         "bananas",
     ],
     "meat_can": [
+        "rectangular meat can",
+        "square meat can",
+        "spam can",
+        "spam-like can",
         "meat can",
         "meat_can",
-        "tin can",
-        "food can",
-        "canned food",
+        "rectangular food can",
+        "box shaped tin of meat",
+        "box-shaped tin of meat",
+        "small rectangular canned meat",
         "canned meat",
         "meat tin",
-        "small tin",
-        "small can",
+        "food tin",
         "meat",
     ],
     "coke_can": [
+        "red cylindrical soda can",
+        "red cola can",
+        "red coke can",
+        "red drink can",
+        "red beverage can",
+        "cylindrical red can",
         "coke can",
         "coca cola can",
         "cola can",
@@ -70,6 +79,16 @@ ALIASES: dict[str, list[str]] = {
         "strawberries",
     ],
     "hammer": [
+        "hammer with long handle",
+        "hammer with wooden handle",
+        "tool with long stick handle",
+        "long handled hammer",
+        "hammer head and stick handle",
+        "metal hammer with handle",
+        "hammer tool",
+        "long handle",
+        "stick handle",
+        "tool handle",
         "tool hammer",
         "metal hammer",
         "hammer",
@@ -124,23 +143,40 @@ ALIASES: dict[str, list[str]] = {
 
 # Aliases sent to the zero-shot detector.  These can be broader than the command
 # aliases, but avoid the generic word "object" because it causes useless boxes.
+# Normal target detection intentionally avoids generic can prompts for
+# coke_can/meat_can; generic prompts live in RELAXED_DETECTOR_ALIASES and are
+# marked as fail-open/fallback by the vision server.
 DETECTOR_ALIASES: dict[str, list[str]] = {
     "banana": ["banana", "yellow banana", "curved yellow banana"],
-    "meat_can": ["meat can", "tin can", "food can", "canned food", "canned meat", "small tin can"],
+    "meat_can": [
+        "rectangular meat can",
+        "square meat can",
+        "spam can",
+        "spam-like can",
+        "rectangular food can",
+        "box-shaped tin of meat",
+        "small rectangular canned meat",
+    ],
     "coke_can": [
-        "cola can",
+        "red cylindrical soda can",
+        "red cola can",
+        "red coke can",
+        "red drink can",
+        "red beverage can",
+        "cylindrical red can",
         "red soda can",
+        "cola can",
         "coca cola can",
-        "can of cola",
-        "soda can",
-        "red can",
-        "drink can",
-        "beverage can",
-        "coke",
-        "cola",
     ],
     "strawberry": ["strawberry", "red strawberry"],
-    "hammer": ["hammer", "tool hammer", "metal hammer"],
+    "hammer": [
+        "hammer with long handle",
+        "hammer with wooden handle",
+        "tool with long stick handle",
+        "long handled hammer",
+        "hammer head and stick handle",
+        "metal hammer with handle",
+    ],
     "book": ["book", "notebook"],
     "eraser": ["eraser", "rubber eraser"],
     "soap": ["soap", "soap bar", "bar of soap"],
@@ -152,12 +188,47 @@ DETECTOR_ALIASES: dict[str, list[str]] = {
     "object": ["object", "small object", "item on table", "thing on table"],
 }
 
+NON_STRICT_EXTRA_DETECTOR_ALIASES: dict[str, list[str]] = {
+    "meat_can": ["meat can", "canned meat", "meat tin", "food tin", "food can", "tin can"],
+    "coke_can": ["coke can", "red can", "cola can", "soda can", "drink can", "beverage can"],
+    "hammer": ["hammer", "hammer tool", "long handle", "stick handle", "tool handle"],
+}
+
 RELAXED_DETECTOR_ALIASES: dict[str, list[str]] = {
     "banana": ["yellow banana", "curved yellow object", "yellow object", "banana"],
-    "meat_can": ["food can", "tin can", "metal can", "small can", "canned food", "small metal object"],
-    "coke_can": ["red can", "drink can", "soda can", "cola can", "beverage can", "red cylindrical object"],
+    "meat_can": [
+        "rectangular meat can",
+        "spam can",
+        "rectangular can",
+        "square can",
+        "canned meat",
+        "food tin",
+        "food can",
+        "tin can",
+        "small can",
+    ],
+    "coke_can": [
+        "red cylindrical soda can",
+        "red coke can",
+        "red can",
+        "drink can",
+        "soda can",
+        "cola can",
+        "beverage can",
+        "red cylindrical object",
+    ],
     "strawberry": ["red fruit", "small red object", "strawberry", "red round object"],
-    "hammer": ["hammer", "tool", "handle", "metal tool"],
+    "hammer": [
+        "hammer with long handle",
+        "long handled hammer",
+        "hammer head and stick handle",
+        "hammer tool",
+        "long handle",
+        "stick handle",
+        "tool handle",
+        "tool",
+        "metal object",
+    ],
     "object": ["object", "small object", "item on table", "thing on table"],
 }
 
@@ -168,10 +239,35 @@ ALIAS_RANK_WEIGHT: dict[str, float] = {
     "small can": 0.70,
     "small tin": 0.70,
     "tin can": 0.78,
+    "metal can": 0.72,
+    "food can": 0.78,
     "drink can": 0.80,
     "beverage can": 0.80,
     "coke": 0.90,
     "cola": 0.95,
+    "rectangular meat can": 1.08,
+    "square meat can": 1.05,
+    "spam can": 1.08,
+    "spam-like can": 1.08,
+    "rectangular food can": 1.04,
+    "red cylindrical soda can": 1.10,
+    "red cola can": 1.08,
+    "red coke can": 1.08,
+    "red drink can": 1.05,
+    "red beverage can": 1.05,
+    "cylindrical red can": 1.08,
+    "hammer with long handle": 1.10,
+    "hammer with wooden handle": 1.08,
+    "tool with long stick handle": 1.08,
+    "long handled hammer": 1.08,
+    "hammer head and stick handle": 1.10,
+    "metal hammer with handle": 1.06,
+    "hammer tool": 0.92,
+    "long handle": 0.82,
+    "stick handle": 0.82,
+    "tool handle": 0.78,
+    "tool": 0.60,
+    "metal object": 0.55,
 }
 
 
@@ -261,6 +357,7 @@ def detector_queries_for_target(
     target: str,
     include_templates: bool = True,
     stage: str | None = None,
+    strict_semantic_prompts: bool = True,
 ) -> list[DetectorQuery]:
     """Return zero-shot detector queries for a canonical target.
 
@@ -270,13 +367,22 @@ def detector_queries_for_target(
     """
     canonical = normalize_label(target)
     stage_name = str(stage or "normal_target_detection").strip().lower()
+    fallback_stage = stage_name in {
+        "relaxed_alias_detection",
+        "relaxed",
+        "generic_object_proposal",
+        "generic",
+        "depth_cluster_fallback",
+    }
     if stage_name in {"relaxed_alias_detection", "relaxed"}:
         aliases = RELAXED_DETECTOR_ALIASES.get(canonical, DETECTOR_ALIASES.get(canonical))
     elif stage_name in {"generic_object_proposal", "generic"}:
         aliases = RELAXED_DETECTOR_ALIASES.get("object", DETECTOR_ALIASES.get("object"))
         canonical = "object"
     else:
-        aliases = DETECTOR_ALIASES.get(canonical)
+        aliases = list(DETECTOR_ALIASES.get(canonical) or [])
+        if not strict_semantic_prompts:
+            aliases.extend(NON_STRICT_EXTRA_DETECTOR_ALIASES.get(canonical, []))
     if aliases is None:
         aliases = [_clean_text(target)] if target else []
 
@@ -287,12 +393,15 @@ def detector_queries_for_target(
         if not alias or alias in seen or alias == "object":
             continue
         seen.add(alias)
-        out.append(DetectorQuery(alias, canonical, ALIAS_RANK_WEIGHT.get(alias, 1.0)))
+        weight = ALIAS_RANK_WEIGHT.get(alias, 1.0)
+        if fallback_stage and alias in {"tin can", "small can", "metal can", "food can"}:
+            weight *= 0.70
+        out.append(DetectorQuery(alias, canonical, weight))
         if include_templates:
             templated = f"a photo of a {alias}"
             if templated not in seen:
                 seen.add(templated)
-                out.append(DetectorQuery(templated, canonical, ALIAS_RANK_WEIGHT.get(alias, 1.0) * 0.95))
+                out.append(DetectorQuery(templated, canonical, weight * 0.95))
     return out
 
 

@@ -20,7 +20,7 @@ class GroundingDinoBackend:
         *,
         enabled: bool = False,
         model_id: str = "IDEA-Research/grounding-dino-base",
-        text_prompt: str = "coke can. meat can. banana. hammer. strawberry.",
+        text_prompt: str = "red cylindrical soda can. rectangular spam-like meat can. banana. hammer with long handle. strawberry.",
         box_threshold: float = 0.25,
         text_threshold: float = 0.20,
         device: str = "auto",
@@ -99,6 +99,7 @@ class GroundingDinoBackend:
         target_label: str,
         camera_name: str,
         query_stage: str = "normal_target_detection",
+        strict_semantic_prompts: bool = True,
     ):
         if image_bgr is None or cloud_msg is None or not self._load():
             return []
@@ -215,5 +216,5 @@ def _coerce_transformers_result(result) -> list[dict[str, Any]]:
 def _prompt_for_target(target_label: str) -> str:
     target = normalize_label(target_label)
     if target == "object":
-        return "coke can. meat can. banana. hammer. strawberry."
+        return "red cylindrical soda can. rectangular spam-like meat can. banana. hammer with long handle. strawberry."
     return target.replace("_", " ") + "."

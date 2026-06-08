@@ -11,6 +11,7 @@ from .config import (
     BOOKSHELF_WRIST_FLIP_OBJECTS,
     DEBUG_GROUND_TRUTH_Z_OFFSETS,
     GRIPPER_CLOSE_POSITIONS,
+    HAMMER_POLICY,
     HOME_JOINTS,
     OBJECT_GRASP_PROFILES,
     OBJECT_PICK_OVERRIDES,
@@ -27,6 +28,8 @@ from .motion_math import calc_rot_time
 
 class PickPlaceMixin:
     def fail_open_uncertain_pick_active(self, object_name):
+        if str(getattr(self, 'current_attempt_type', '') or '') == 'safe_uncertain_attempt':
+            return True
         provider = getattr(self, 'pose_provider', None)
         text = getattr(provider, 'latest_detection_json', '') or ''
         if not text:
@@ -39,21 +42,40 @@ class PickPlaceMixin:
         if target and target != object_name:
             return False
         stage = str(data.get('detection_stage', '') or '')
-        return bool(data.get('fail_open_used', False)) or stage in {
-            'relaxed_alias_detection',
-            'generic_object_proposal',
-            'depth_cluster_fallback',
-        }
+        return (
+            bool(data.get('attempt_required_by_policy', False))
+            or bool(data.get('fail_open_used', False))
+            or stage in {
+                'relaxed_alias_detection',
+                'generic_object_proposal',
+                'depth_cluster_fallback',
+            }
+        )
 
     def object_grasp_profile(self, object_name):
         profile = dict(OBJECT_GRASP_PROFILES.get(object_name, {}))
         profile['_profile_source'] = 'config'
         profile['_calibration_override_active'] = False
         profile['_calibration_override'] = {}
+        if object_name == 'hammer' and bool(HAMMER_POLICY.get('attempt_if_requested', True)):
+            profile.update(UNCERTAIN_PICK_PROFILE)
+            if HAMMER_POLICY.get('velocity_scale') is not None:
+                profile['velocity_scale'] = float(HAMMER_POLICY.get('velocity_scale'))
+                profile['acceleration_scale'] = float(
+                    HAMMER_POLICY.get('acceleration_scale', HAMMER_POLICY.get('velocity_scale'))
+                )
+            profile['strategy'] = HAMMER_POLICY.get('grasp_strategy', profile.get('strategy', 'hammer_handle_grasp'))
+            profile['_profile_source'] = 'hammer_policy'
+            profile['_hammer_policy_active'] = True
         if self.fail_open_uncertain_pick_active(object_name):
             profile.update(UNCERTAIN_PICK_PROFILE)
             profile['_profile_source'] = 'fail_open_uncertain_pick'
             profile['_fail_open_uncertain_pick'] = True
+            if object_name == 'hammer' and HAMMER_POLICY.get('velocity_scale') is not None:
+                profile['velocity_scale'] = float(HAMMER_POLICY.get('velocity_scale'))
+                profile['acceleration_scale'] = float(
+                    HAMMER_POLICY.get('acceleration_scale', HAMMER_POLICY.get('velocity_scale'))
+                )
         runtime = getattr(self, 'calibration_profile_overrides', {}) or {}
         override = runtime.get(object_name)
         if isinstance(override, dict):
@@ -173,6 +195,7 @@ class PickPlaceMixin:
             'close_force',
             'use_vision_grasp_orientation',
             'require_lift_verification',
+            'abort_if_no_object_lifted',
             'yaw_mode',
             'velocity_scale',
             'acceleration_scale',
@@ -318,6 +341,7 @@ class PickPlaceMixin:
         post_close_sleep = float(overrides.get('post_close_sleep', 0.0))
         close_force = float(overrides.get('close_force', 1.0))
         require_lift_verification = bool(overrides.get('require_lift_verification', False))
+        abort_if_no_object_lifted = bool(overrides.get('abort_if_no_object_lifted', False))
         close_timeout = float(profile.get('close_timeout', overrides.get('close_timeout', 3.0)))
         velocity_scale = self._bounded_motion_scale(
             profile.get('velocity_scale', overrides.get('velocity_scale', 1.0))
@@ -338,7 +362,8 @@ class PickPlaceMixin:
             f'source={profile_source}, close_pos={close_pos:.3f}, '
             f'z_offset={grasp_z_offset:.4f}, velocity_scale={velocity_scale:.2f}, '
             f'yaw_mode={profile.get("yaw_mode", "default")}, '
-            f'require_lift_verification={require_lift_verification}'
+            f'require_lift_verification={require_lift_verification}, '
+            f'abort_if_no_object_lifted={abort_if_no_object_lifted}'
         )
         pick_plan = {
             'object_name': object_name,
@@ -367,6 +392,7 @@ class PickPlaceMixin:
             'post_close_sleep': post_close_sleep,
             'close_force': close_force,
             'require_lift_verification': require_lift_verification,
+            'abort_if_no_object_lifted': abort_if_no_object_lifted,
             'close_timeout': close_timeout,
             'velocity_scale': velocity_scale,
             'acceleration_scale': acceleration_scale,
@@ -437,11 +463,14 @@ class PickPlaceMixin:
                 pick_plan['retreat_pose'],
                 duration=pick_plan['lift_duration'],
             )
+            lift_verified, lift_reason = self.runtime_lift_verification(object_name, pick_plan)
             if bool(pick_plan.get('require_lift_verification', False)):
-                self.get_logger().warn(
+                log_method = self.get_logger().info if lift_verified else self.get_logger().warn
+                log_method(
                     f'Uncertain pick lift verification: object={object_name}, '
                     f'using runtime gripper-state proxy only; '
-                    f'actual_close_pos={getattr(self, "js_gripper_position", "unknown")}'
+                    f'actual_close_pos={getattr(self, "js_gripper_position", "unknown")}, '
+                    f'result={lift_verified}, reason={lift_reason}'
                 )
             self.publish_motion_debug(object_name, pick_plan, success=True)
         except Exception as exc:
@@ -451,7 +480,25 @@ class PickPlaceMixin:
             'grasp_pose': pick_plan['grasp_pose'],
             'retreat_pose': pick_plan['retreat_pose'],
             'pick_pan_angle': pick_plan['pick_pan_angle'],
+            'lift_verified': bool(lift_verified),
+            'lift_verification_reason': lift_reason,
+            'abort_place': bool(pick_plan.get('abort_if_no_object_lifted', False)) and not bool(lift_verified),
         }
+
+    def runtime_lift_verification(self, object_name, pick_plan):
+        if not bool(pick_plan.get('require_lift_verification', False)):
+            return True, 'not_required'
+        actual = getattr(self, 'js_gripper_position', None)
+        try:
+            actual_value = float(actual)
+        except (TypeError, ValueError):
+            return True, 'gripper_state_unavailable_assume_held'
+        if not math.isfinite(actual_value):
+            return True, 'gripper_state_unavailable_assume_held'
+        empty_threshold = float(pick_plan.get('empty_gripper_close_threshold', 0.015))
+        if actual_value <= empty_threshold:
+            return False, 'gripper_fully_closed_runtime_proxy'
+        return True, 'gripper_not_fully_closed_runtime_proxy'
 
     def pick(self, object_name, object_pose):
         # Safety check: Is the object actually reachable before doing math?
@@ -773,6 +820,7 @@ class PickPlaceMixin:
             'close_force': float(pick_plan.get('close_force', 1.0)),
             'close_timeout': float(pick_plan.get('close_timeout', 3.0)),
             'require_lift_verification': bool(pick_plan.get('require_lift_verification', False)),
+            'abort_if_no_object_lifted': bool(pick_plan.get('abort_if_no_object_lifted', False)),
             'grasp_z_offset': float(pick_plan.get('grasp_z_offset', 0.0)),
             'z_offset': float(pick_plan.get('grasp_z_offset', 0.0)),
             'z_surface': float(pick_plan.get('target_z_surface', 0.0)),
@@ -838,6 +886,7 @@ class PickPlaceMixin:
                     'close_pos': float(pick_plan.get('close_pos', 0.0)),
                     'close_timeout': float(pick_plan.get('close_timeout', 3.0)),
                     'require_lift_verification': bool(pick_plan.get('require_lift_verification', False)),
+                    'abort_if_no_object_lifted': bool(pick_plan.get('abort_if_no_object_lifted', False)),
                     'actual_close_pos': str(getattr(self, 'js_gripper_position', 'unknown')),
                 },
                 'motion': {

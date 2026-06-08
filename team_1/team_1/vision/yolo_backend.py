@@ -262,6 +262,7 @@ class YoloBackend:
         target_label: str,
         camera_name: str,
         query_stage: str = "normal_target_detection",
+        strict_semantic_prompts: bool = True,
     ):
         self._reset_last_debug(target_label, camera_name, image_bgr)
         if image_bgr is None:
