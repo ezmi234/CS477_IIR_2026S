@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os
 from glob import glob
-from setuptools import setup
+from setuptools import find_packages, setup
 from pathlib import Path
     
 package_name = 'manip_challenge'
@@ -34,7 +34,7 @@ def package_files(data_files, directory_list):
 setup(
     name=package_name,
     version='0.0.1',
-    packages=[package_name],
+    packages=find_packages(),
     data_files=package_files(data_files, ['data/models/', 'launch/', 'data/worlds/', 'config']),
     install_requires=[
         'setuptools',
@@ -63,7 +63,8 @@ setup(
             'get_pose     = manip_challenge.get_pose:main',            
             'move_gripper = manip_challenge.move_gripper:main',
             'move_joint   = manip_challenge.move_joint:main',            
+            'add_object_challenge = manip_challenge.challenge_scripts.add_object_challenge:main',
+            'task_command_pub     = manip_challenge.challenge_scripts.task_command_pub:main',
             ],
     },
 )
-

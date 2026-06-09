@@ -26,8 +26,8 @@ class ImageSaver(Node):
         super().__init__('image_saver')
         
         # Choose camera image topic to save
-        topic_name = '/camera/camera/color/image_raw'
-        # topic_name = '/wrist_camera/wrist_camera/color/image_raw'
+        # topic_name = '/camera/camera/color/image_raw'
+        topic_name = '/wrist_camera/wrist_camera/color/image_raw'
         
         self.subscription = self.create_subscription(Image, topic_name, self.listener_callback, qos_profile)
         self.bridge = CvBridge()
