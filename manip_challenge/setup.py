@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os
 from glob import glob
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup, find_packages
 from pathlib import Path
     
 package_name = 'manip_challenge'
@@ -63,6 +63,8 @@ setup(
             'get_pose     = manip_challenge.get_pose:main',            
             'move_gripper = manip_challenge.move_gripper:main',
             'move_joint   = manip_challenge.move_joint:main',            
+            'add_object_challenge = manip_challenge.challenge_scripts.add_object_challenge:main',
+            'task_command_pub     = manip_challenge.challenge_scripts.task_command_pub:main',
             'motion_node = manip_challenge.motion.motion_node:main',
             # 'demo_motion_pipeline = manip_challenge.motion.demo_motion_pipeline:main',
             ],

@@ -143,3 +143,9 @@ Our competition process flow is as follow:
 
 - Each team is allocated a maximum of 8 minutes to complete all assigned tasks. If the tasks are not completed within this timeframe, the evaluation will be based on the number of successful manipulations achieved up to the 8-minute mark.
 
+
+# Competition (for TA)
+~~~~bash
+ros2 launch manip_challenge ur5_setup_set3_picking.launch.py
+~~~~
+
